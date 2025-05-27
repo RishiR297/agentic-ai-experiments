@@ -1,4 +1,6 @@
 <p> Needs necessary environment variables for agent to run</p>
 
 Run:
-<code> python main.py </code>
+<code> 
+cd '.\Use Cases\Use Case 1\code\'
+python main.py </code>
