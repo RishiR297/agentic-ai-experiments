@@ -35,7 +35,7 @@ for i, tool in enumerate(MCP_TOOL_REGISTRY):
     print(json.dumps(tool, indent=2) if isinstance(tool, dict) else tool)
 
 for tool in MCP_TOOL_REGISTRY:
-    print(f"- {tool.get('name', '<no name>')}")
+    print(f"- {tool['function']['name']}")
 
 
 # MCP-based planner node
