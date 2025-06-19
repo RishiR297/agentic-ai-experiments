@@ -1,63 +1,154 @@
-from agent.state import AgentState
-from agent.tools.appointment import get_appointments
-from typing import Optional
-import re
-import os
+# # ==============================================
+# # File: nodes.py
+# # Purpose: Define LangGraph nodes that process the agent’s internal state
+# # ==============================================
 
-from langchain_community.chat_models import AzureChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
+import os
 from dotenv import load_dotenv
+from pydantic import BaseModel
+import json
+
+from agent.tools.appointment import MCP_TOOL_REGISTRY, MCP_FUNCTION_LOOKUP
+from langchain_openai import AzureChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_core.messages import SystemMessage, HumanMessage
+
 load_dotenv()
 
+# Azure OpenAI LLM setup
+llm_with_tools = AzureChatOpenAI(
+    deployment_name=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"),
+    temperature=0,
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version="2024-02-15-preview",
+    model_kwargs={"tools": MCP_TOOL_REGISTRY}
 
-# Initialize LLM once
-llm = AzureChatOpenAI(
-    api_key=os.environ["AZURE_OPENAI_API_KEY"],
-    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-    deployment_name=os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"],
-    api_version="2024-02-15-preview"
 )
 
+import json
 
-def extract_doctor_name(user_input: str) -> Optional[str]:
-    # Match "Dr. Antonella" or similar
-    match = re.search(r"Dr\.?\s+([A-Za-z']+)", user_input)
-    if match:
-        return match.group(1)
-    return None
+print("🧪 Tools registered:")
+for i, tool in enumerate(MCP_TOOL_REGISTRY):
+    print(f"Tool #{i + 1}: type={type(tool)}")
+    print(json.dumps(tool, indent=2) if isinstance(tool, dict) else tool)
+
+for tool in MCP_TOOL_REGISTRY:
+    print(f"- {tool.get('name', '<no name>')}")
 
 
-# Node 1: input handler (already has user_input in state)
-def get_user_input(state: AgentState) -> AgentState:
+# MCP-based planner node
+MCP_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are an AI assistant that decides the next action."),
+    ("human", "{user_input}")
+])
+
+def planner_node(state: dict) -> dict:
+    user_input = state.get("user_input")
+    if not user_input:
+        raise ValueError("Missing 'user_input' in agent state")
+
+    response = llm_with_tools.invoke([
+        SystemMessage(content="You are a helpful assistant."),
+        HumanMessage(content=user_input)
+    ])
+
+    clean_steps = []
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        for tool_call in response.tool_calls:
+            # 🔥 Convert args safely
+            args_dict = (
+                tool_call.args.model_dump()
+                if hasattr(tool_call.args, "model_dump")
+                else dict(tool_call.args)
+            )
+            clean_steps.append({
+                "tool_name": tool_call.name,
+                "args": args_dict
+            })
+        return {
+            **state,
+            "intermediate_steps": clean_steps,
+            "final_answer": response.content
+        }
+    else:
+        return {
+            **state,
+            "intermediate_steps": [],
+            "final_answer": response.content
+        }
+
+# Router node
+def route_node(state: dict) -> dict:
+    steps = state.get("intermediate_steps", [])
+    state["next"] = "tool" if steps else "answer"
     return state
 
+# ✅ FIX: Use MCP_TOOL_REGISTRY as is
+TOOL_LOOKUP = MCP_FUNCTION_LOOKUP
 
-# Node 2: query appointments from tool
-def query_appointments(state: AgentState) -> AgentState:
-    user_input = state.get("user_input", "")
-    doctor_name = extract_doctor_name(user_input)
-    output = get_appointments.invoke({"doctor_name": doctor_name})
+# Tool executor node
+def call_tool_node(state: dict) -> dict:
+    tool_calls = state.get("intermediate_steps", [])
+    if not tool_calls:
+        raise ValueError("No tool_calls found in state.")
+
+    results = []
+    booking_confirmation = None
+    appointments_output = None
+
+    for call in tool_calls:
+        tool_name = call["tool_name"]
+        arguments = call["args"]
+
+        tool_fn = TOOL_LOOKUP.get(tool_name)
+        if not tool_fn:
+            results.append(f"❌ Unknown tool: {tool_name}")
+        else:
+            try:
+                result = tool_fn(**arguments)
+                print(f"🔍 Tool '{tool_name}' result:", result)
+                results.append(result)
+
+                # ✅ Save specific outputs
+                if tool_name == "book_appointment_tool":
+                    booking_confirmation = result
+                elif tool_name == "get_appointments":
+                    appointments_output = result
+
+            except Exception as e:
+                results.append(f"❌ Error calling tool {tool_name}: {e}")
+
     return {
         **state,
-        "appointments_output": output
+        "tool_results": results,
+        "booking_confirmation": booking_confirmation,
+        "appointments_output": appointments_output,
+        "next": "answer"
     }
 
 
-# Node 3: summarize the results naturally using Azure OpenAI
-def generate_final_answer(state: AgentState) -> AgentState:
-    appointments_output = state.get("appointments_output", "")
-    user_input = state.get("user_input", "")
+# Final answer serializer
+def generate_final_answer(state: dict) -> dict:
+    if "tool_results" in state:
+        safe_results = []
+        for item in state["tool_results"]:
+            if isinstance(item, BaseModel):
+                safe_results.append(item.model_dump())
+            elif not isinstance(item, (str, int, float, dict, list)):
+                safe_results.append(str(item))
+            else:
+                safe_results.append(item)
 
-    messages = [
-        SystemMessage(content="You are a friendly appointment assistant."),
-        HumanMessage(content=f"The user asked: {user_input}\n"
-                             f"Here are the appointment results: {appointments_output}\n"
-                             f"Please generate a helpful and natural response.")
-    ]
-
-    response = llm.invoke(messages)
+        final_output = "\n".join([
+            json.dumps(r, indent=2) if isinstance(r, (dict, list)) else str(r)
+            for r in safe_results
+        ])
+    else:
+        final_output = state.get("final_answer", "🤖 I couldn't process that.")
 
     return {
         **state,
-        "final_answer": response.content
+        "final_answer": final_output
     }

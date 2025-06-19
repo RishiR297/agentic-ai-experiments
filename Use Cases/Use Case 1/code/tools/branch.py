@@ -1,11 +1,42 @@
+# ==============================================
+# File: tools/branch.py
+# Purpose: Provide utility functions to retrieve and format clinic branch opening hours
+# ==============================================
+
+# -----------------------------
+# Imports
+# -----------------------------
 from utils.db import get_db_connection
 
+
+# -----------------------------
+# Constants
+# -----------------------------
 BRANCH_NAMES = {
     1: "Dbayeh",
     2: "Unmapped Branch"
 }
 
+
+# -----------------------------
+# Utility Function: Convert weekday index to name
+# -----------------------------
+def weekday_name(index):
+    """
+    Converts numeric weekday index (0–6) to a human-readable weekday name.
+    """
+    names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    return names[index] if 0 <= index < len(names) else f"Invalid Day {index}"
+
+
+# -----------------------------
+# Main Function: List Branch Opening Hours
+# -----------------------------
 def list_branch_opening_hours():
+    """
+    Queries the database for branch opening hours, formats them, and returns a list of tuples:
+    (Branch Name, Weekday Name, Time Range or 'Closed')
+    """
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -25,7 +56,7 @@ def list_branch_opening_hours():
         if row[4]:  # IsClosed
             time_range = "Closed"
         else:
-            # Trim .0000000 from SQL Server-style times
+            # Trim .0000000 from SQL Server-style time strings
             open_time = row[2].split('.')[0]
             close_time = row[3].split('.')[0]
             time_range = f"{open_time} - {close_time}"
@@ -33,10 +64,10 @@ def list_branch_opening_hours():
 
     return readable_hours
 
-def weekday_name(index):
-    names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    return names[index] if 0 <= index < len(names) else f"Invalid Day {index}"
 
+# -----------------------------
+# Test Block
+# -----------------------------
 if __name__ == "__main__":
     print("Branch Opening Hours:")
     for branch_name, weekday, hours in list_branch_opening_hours():
