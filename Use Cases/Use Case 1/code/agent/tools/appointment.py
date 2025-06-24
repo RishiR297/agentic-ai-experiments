@@ -7,7 +7,7 @@
 # Imports
 # -----------------------------
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from utils.db import get_db_connection
 from langchain_core.tools import tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -237,7 +237,12 @@ def book_appointment_tool(
 
     # Step 2: Check availability
     if not is_doctor_available(doctor_id, start_time, end_time):
-        return f"❌ Dr. {full_name} is not available from {start_time} to {end_time}"
+        suggestions = suggest_appointment_slots(doctor_name=full_name, after=start_time)
+        suggestion_list = "\n".join(suggestions)
+        return (
+            f"❌ Dr. {full_name} is not available from {start_time} to {end_time}.\n"
+            "Here are some upcoming available slots:\n" + suggestion_list
+        )
 
     # Step 3: Book the appointment
     return create_appointment(
@@ -249,6 +254,127 @@ def book_appointment_tool(
         start_time=start_time,
         end_time=end_time
     )
+    
+@tool
+def suggest_appointment_slots(
+    doctor_name: str,
+    after: Optional[str] = None,
+    limit: int = 5,
+    weekday: Optional[int] = None
+) -> str:
+    """
+    Suggest available appointment slots for a doctor after a given datetime,
+    considering weekly schedule and off days, with formatted dates and times.
+    """
+    if not after:
+        after_dt = datetime.now()
+    else:
+        try:
+            after_dt = datetime.fromisoformat(after)
+            if after_dt < datetime.now():
+                after_dt = datetime.now()
+
+            if weekday is not None:
+                after_dt = after_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        except:
+            after_dt = datetime.now()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    clean_name = doctor_name.replace("Dr.", "").replace("Dr", "").strip().lower()
+
+    # Step 1: Resolve doctor ID
+    cursor.execute("""
+        SELECT DISTINCT DoctorId FROM View_Appointments
+        WHERE LOWER(DoctorName) LIKE ?
+        LIMIT 1
+    """, (f"%{clean_name}%",))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return f"❌ Could not find doctor matching '{doctor_name}'"
+    doctor_id = row[0]
+    print(f"✅ Doctor ID resolved for '{doctor_name}': {doctor_id}")
+
+    # Step 2: Get working schedule
+    cursor.execute("""
+        SELECT WeekDay, FromTime, ToTime
+        FROM COR_DoctorSchedule
+        WHERE DoctorId = ? AND IsActive = 1 AND (IsOff IS NULL OR IsOff = 0)
+    """, (doctor_id,))
+    schedule = cursor.fetchall()
+    print(f"🧪 Schedule rows fetched for doctor {doctor_id}: {schedule}")
+
+    if not schedule:
+        conn.close()
+        return f"❌ No active schedule found for doctor with ID {doctor_id}"
+
+    # Step 3: Get off days
+    cursor.execute("""
+        SELECT Date FROM COR_DoctorOffSchedule
+        WHERE DoctorId = ? AND IsActive = 1 AND Date >= ?
+    """, (doctor_id, after_dt.strftime('%Y-%m-%d')))
+    off_dates = {datetime.fromisoformat(row[0]).date() for row in cursor.fetchall()}
+    conn.close()
+
+    # Step 4: Iterate and find slots
+    slots = []
+    max_days = 14
+    day_cursor = after_dt
+    weekday_schedule_map = {int(wd): (from_t, to_t) for wd, from_t, to_t in schedule}
+
+    days_checked = 0
+    while len(slots) < limit and days_checked < max_days:
+        py_weekday = day_cursor.weekday()  # 0=Monday
+        db_weekday = py_weekday + 1        # 1=Monday (DB)
+        day_date = day_cursor.date()
+
+        # Skip if a specific weekday is requested and this isn't it
+        if weekday is not None and py_weekday != weekday:
+            day_cursor += timedelta(days=1)
+            days_checked += 1
+            continue
+
+        # Skip off-days
+        if day_date in off_dates:
+            day_cursor += timedelta(days=1)
+            days_checked += 1
+            continue
+
+        print(f"✅ Weekday schedule map: {weekday_schedule_map}")
+        print(f"🔍 Checking for weekday {db_weekday} on {day_cursor.strftime('%A')}")
+
+        if db_weekday in weekday_schedule_map:
+            from_time, to_time = weekday_schedule_map[db_weekday]
+            from_fmt = from_time[:5]  # "HH:MM"
+            to_fmt = to_time[:5]
+
+            start_dt = datetime.combine(day_date, datetime.strptime(from_fmt, "%H:%M").time())
+            end_dt = datetime.combine(day_date, datetime.strptime(to_fmt, "%H:%M").time())
+
+            # Check for conflicts
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 1 FROM View_Appointments
+                WHERE DoctorId = ?
+                AND (? < EndDateTime AND ? > StartDateTime)
+            """, (doctor_id, start_dt.isoformat(), end_dt.isoformat()))
+            conflict = cursor.fetchone()
+            conn.close()
+
+            if conflict:
+                slots.append(f"🛑 {day_cursor.strftime('%A, %b %d')}: {from_fmt} - {to_fmt} (Fully booked)")
+            else:
+                slots.append(f"📅 {day_cursor.strftime('%A, %b %d')}: {from_fmt} - {to_fmt}")
+
+        day_cursor += timedelta(days=1)
+        days_checked += 1
+
+    if not slots:
+        return "❌ No available slots found in the next two weeks."
+    return "\n".join(slots)
 
 # -----------------------------
 # MCP-Compatible Tool Registry
@@ -256,11 +382,12 @@ def book_appointment_tool(
 # Registry for LLM (OpenAI schema dicts)
 MCP_TOOL_REGISTRY = [
     convert_to_openai_tool(book_appointment_tool),
-    convert_to_openai_tool(get_appointments)
+    convert_to_openai_tool(get_appointments),
+    convert_to_openai_tool(suggest_appointment_slots)  # <- this will now reflect the new signature
 ]
 
-# Registry for function execution
 MCP_FUNCTION_LOOKUP = {
     "book_appointment_tool": book_appointment_tool,
-    "get_appointments": get_appointments
+    "get_appointments": get_appointments,
+    "suggest_appointment_slots": suggest_appointment_slots
 }

@@ -11,6 +11,9 @@ import json
 import traceback
 
 st.set_page_config(page_title="Doctor Appointment Agent", page_icon="🤖")
+# Initialize memory for LangGraph state
+if "agent_state" not in st.session_state:
+    st.session_state["agent_state"] = {}
 
 st.title("🤖 Doctor Appointment Agent")
 st.markdown("Ask anything about appointments, doctors, or bookings.")
@@ -45,11 +48,13 @@ if st.button("Run Agent") and user_input:
 
         try:
             # 👇 Prepare initial state (you might have a more elaborate one)
-            state = {"user_input": user_input}
+            state = st.session_state["agent_state"]
+            state["user_input"] = user_input
 
             # 💉 Trap agent invoke & serialization
             result = doctor_agent_executor.invoke(state)
-
+            st.session_state["agent_state"] = result  # Save updated state
+            
             # 🧪 Log raw agent output BEFORE serialization
             print("🧪 Raw agent output before serialization:")
             print(result)

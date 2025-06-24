@@ -15,9 +15,13 @@ class AgentState(TypedDict, total=False):
     status: Optional[str]
     after: Optional[str]
     tool_name: Optional[str]          # Name of the tool to call (e.g., "book_appointment", "get_appointments")
+    requested_weekday: Optional[int] = None  # 0 = Monday ... 6 = Sunday
+
     # --- Tool outputs ---
     appointments_output: Optional[str]       # Result from get_appointments
     booking_confirmation: Optional[str]      # Result from book_appointment_tool
 
     # --- Final agent output ---
     final_answer: Optional[str]              # Natural language response from LLM
+
+    REQUIRED_FIELDS = ["doctor_name", "patient_name", "branch_id", "service_name", "start_time", "end_time"]

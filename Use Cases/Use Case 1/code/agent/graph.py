@@ -1,4 +1,5 @@
 # agent/graph.py
+
 from langgraph.graph import StateGraph
 from langchain_core.runnables import RunnableLambda
 from agent.nodes import (
@@ -6,10 +7,13 @@ from agent.nodes import (
     route_node,
     call_tool_node,
     generate_final_answer,
+    ask_for_missing_fields_node,
+    respond_naturally_node  # ✅ New node added
 )
 
+# Helper for routing
 path_fn = RunnableLambda(lambda state: state["next"])
-path_fn.name = "router_decision" 
+path_fn.name = "router_decision"
 
 # -----------------------------
 # Step 1: Build the graph
@@ -17,35 +21,41 @@ path_fn.name = "router_decision"
 graph = StateGraph(dict)
 
 # Define all nodes
-graph.add_node("planner", planner_node)              # Uses LLM + MCP to choose tool
-graph.add_node("router", route_node)                 # Checks for tool_calls in response
-graph.add_node("tool", call_tool_node)               # Executes selected tool
-graph.add_node("answer", generate_final_answer)      # Generates final answer
+graph.add_node("planner", planner_node)                     # LLM decides next action
+graph.add_node("router", route_node)                        # Chooses branch: ask, tool, or finish
+graph.add_node("respond", respond_naturally_node)           # ✅ Gives natural response before tool
+graph.add_node("tool", call_tool_node)                      # Executes the tool
+graph.add_node("answer", generate_final_answer)             # Formats final output
+graph.add_node("ask_missing_info", ask_for_missing_fields_node)
 
-# Entry and flow control
+# Entry point
 graph.set_entry_point("planner")
 graph.add_edge("planner", "router")
 
-# Conditional transition from router
+# Router logic: decide next step
 graph.add_conditional_edges(
     source="router",
     path=path_fn,
     path_map={
-        "tool": "tool",
-        "answer": "answer"
+        "tool": "respond",                # ✅ New: respond naturally before calling tool
+        "answer": "answer",
+        "ask_missing_info": "ask_missing_info"
     }
 )
 
+# ✅ New edge: respond first → then tool
+graph.add_edge("respond", "tool")
 
-
-
-# After executing tool, always generate final answer
+# After tool execution, always answer
 graph.add_edge("tool", "answer")
 
-# Final node
+# Also go to answer after asking for missing fields
+graph.add_edge("ask_missing_info", "answer")
+
+# Finish node
 graph.set_finish_point("answer")
 
 # -----------------------------
-# Step 2: Compile the graph into a runnable executor
+# Step 2: Compile the graph
 # -----------------------------
 doctor_agent_executor = graph.compile()
