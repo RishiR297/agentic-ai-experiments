@@ -3,6 +3,7 @@
 from langgraph.graph import StateGraph
 from langchain_core.runnables import RunnableLambda
 from agent.nodes import (
+    welcome_node,
     planner_node,
     route_node,
     call_tool_node,
@@ -21,6 +22,7 @@ path_fn.name = "router_decision"
 graph = StateGraph(dict)
 
 # Define all nodes
+graph.add_node("welcome", welcome_node)
 graph.add_node("planner", planner_node)                     # LLM decides next action
 graph.add_node("router", route_node)                        # Chooses branch: ask, tool, or finish
 graph.add_node("respond", respond_naturally_node)           # ✅ Gives natural response before tool
@@ -29,7 +31,8 @@ graph.add_node("answer", generate_final_answer)             # Formats final outp
 graph.add_node("ask_missing_info", ask_for_missing_fields_node)
 
 # Entry point
-graph.set_entry_point("planner")
+graph.set_entry_point("welcome")
+graph.add_edge("welcome", "planner")
 graph.add_edge("planner", "router")
 
 # Router logic: decide next step
@@ -37,17 +40,16 @@ graph.add_conditional_edges(
     source="router",
     path=path_fn,
     path_map={
-        "tool": "respond",                # ✅ New: respond naturally before calling tool
+        "tool": "tool",                # ✅ New: respond naturally before calling tool
         "answer": "answer",
         "ask_missing_info": "ask_missing_info"
     }
 )
 
 # ✅ New edge: respond first → then tool
-graph.add_edge("respond", "tool")
+graph.add_edge("tool", "respond")    # ✅ goes from tool → respond
 
-# After tool execution, always answer
-graph.add_edge("tool", "answer")
+graph.add_edge("respond", "answer")  # ✅ This is the correct final transition
 
 # Also go to answer after asking for missing fields
 graph.add_edge("ask_missing_info", "answer")

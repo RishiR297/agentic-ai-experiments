@@ -1,28 +1,46 @@
 # ==============================================
 # File: streamlit_app.py
-# Purpose: Streamlit UI to demo LangGraph appointment agent (MCP style)
+# Purpose: Streamlit UI to demo LangGraph appointment agent (via FastAPI MCP server)
 # ==============================================
 
 import streamlit as st
-from agent.graph import doctor_agent_executor
-from pydantic import BaseModel
-from collections.abc import Mapping
 import json
+import requests
+from collections.abc import Mapping
+from pydantic import BaseModel
 import traceback
 
+# -----------------------------
+# Config
+# -----------------------------
+BACKEND_URL = "http://localhost:8000/invoke"  # Make sure FastAPI server is running here
+
 st.set_page_config(page_title="Doctor Appointment Agent", page_icon="🤖")
-# Initialize memory for LangGraph state
+
+# -----------------------------
+# Init State
+# -----------------------------
 if "agent_state" not in st.session_state:
-    st.session_state["agent_state"] = {}
+    st.session_state["agent_state"] = {
+        "chat_history": [],
+        "identity": "user_001"
+    }
 
 st.title("🤖 Doctor Appointment Agent")
 st.markdown("Ask anything about appointments, doctors, or bookings.")
 
-# --- Text input ---
-user_input = st.text_input("What would you like to do?", placeholder="e.g., I want to book with Dr. Patel next Monday")
+# -----------------------------
+# Display Chat History
+# -----------------------------
+for msg in st.session_state["agent_state"].get("chat_history", []):
+    with st.chat_message("user" if msg["type"] == "human" else "assistant"):
+        st.markdown(msg["content"])
 
+user_input = st.chat_input("How can I help you today?")
 
-# --- Recursive serializer with error trap ---
+# -----------------------------
+# Serializer
+# -----------------------------
 def serialize_result(result):
     try:
         if isinstance(result, BaseModel):
@@ -34,60 +52,73 @@ def serialize_result(result):
         elif isinstance(result, (str, int, float, type(None), bool)):
             return result
         else:
-            return str(result)  # fallback for unserializable types
+            return str(result)
     except Exception as e:
         print("❌ Serialization error:", e)
         print("Offending object type:", type(result))
         traceback.print_exc()
         raise
 
-
-# --- Run Agent Button ---
-if st.button("Run Agent") and user_input:
-    with st.spinner("Running LangGraph agent..."):
-
+# -----------------------------
+# Run Agent if Input
+# -----------------------------
+if user_input:
+    with st.spinner("Running LangGraph agent via backend..."):
         try:
-            # 👇 Prepare initial state (you might have a more elaborate one)
             state = st.session_state["agent_state"]
             state["user_input"] = user_input
 
-            # 💉 Trap agent invoke & serialization
-            result = doctor_agent_executor.invoke(state)
-            st.session_state["agent_state"] = result  # Save updated state
-            
-            # 🧪 Log raw agent output BEFORE serialization
-            print("🧪 Raw agent output before serialization:")
-            print(result)
-            print("🧪 Type of result:", type(result))
+            # 🔁 POST to FastAPI
+            response = requests.post(BACKEND_URL, json={"state": state})
+            response.raise_for_status()
+            result = response.json()
 
+            st.session_state["agent_state"] = result
             result = serialize_result(result)
+
+            final_answer = result.get("final_answer", "🤖 No answer produced.")
+
+            # Append to chat history
+            st.session_state["agent_state"]["chat_history"].append(
+                {"type": "human", "content": user_input}
+            )
+            st.session_state["agent_state"]["chat_history"].append(
+                {"type": "ai", "content": final_answer}
+            )
+
+            # Show assistant reply
+            with st.chat_message("assistant"):
+                st.markdown(final_answer)
+
+            if result.get("appointments_output"):
+                st.subheader("📅 Appointment Query Result")
+                st.code(
+                    json.dumps(result["appointments_output"], indent=2)
+                    if isinstance(result["appointments_output"], (dict, list))
+                    else str(result["appointments_output"]),
+                    language="json",
+                )
+
+            if result.get("booking_confirmation"):
+                st.subheader("✅ Booking Confirmation")
+                st.code(
+                    json.dumps(result["booking_confirmation"], indent=2)
+                    if isinstance(result["booking_confirmation"], (dict, list))
+                    else str(result["booking_confirmation"]),
+                    language="json",
+                )
 
         except Exception as e:
             st.error(f"Agent failed: {e}")
             st.text("🔍 Traceback:")
-            st.text(traceback.format_exc())  # ← full traceback in UI
-            raise  # still shows in dev console
-
-        try:
-            # --- Display Final Answer ---
-            st.subheader("🧠 Final Answer")
-            st.success(result.get("final_answer", "No answer produced."))
-
-            # --- Tool Output Display ---
-            if result.get("appointments_output"):
-                st.subheader("📅 Appointment Query Result")
-                st.code(json.dumps(result["appointments_output"], indent=2) if isinstance(result["appointments_output"], (dict, list)) else str(result["appointments_output"]), language="json")
-
-
-            if result.get("booking_confirmation"):
-                st.subheader("✅ Booking Confirmation")
-                st.code(json.dumps(result["booking_confirmation"], indent=2) if isinstance(result["booking_confirmation"], (dict, list)) else str(result["booking_confirmation"]), language="json")
-
-            # --- Optional Debug Output ---
-            # st.subheader("🛠 Final State")
-            # st.json(result)
-
-        except Exception as e:
-            st.error(f"Agent display logic failed: {e}")
-            st.text("🔍 Traceback:")
             st.text(traceback.format_exc())
+
+# -----------------------------
+# Reset Button
+# -----------------------------
+if st.button("🧹 Reset Agent"):
+    st.session_state["agent_state"] = {
+        "chat_history": [],
+        "identity": "user_001"
+    }
+    st.success("Agent memory reset!")

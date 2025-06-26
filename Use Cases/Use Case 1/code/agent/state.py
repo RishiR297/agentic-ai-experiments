@@ -1,10 +1,11 @@
 from typing import TypedDict, Optional
-
+from typing import List, Literal, Union
+from langchain_core.messages import BaseMessage
 
 class AgentState(TypedDict, total=False):
     # --- Core fields ---
-    user_input: str                   # Raw user input (e.g., "I want to book with Dr. Smith")
-    
+    user_input: str
+
     # --- Tool inputs ---
     doctor_name: Optional[str]
     patient_name: Optional[str]
@@ -14,14 +15,18 @@ class AgentState(TypedDict, total=False):
     end_time: Optional[str]
     status: Optional[str]
     after: Optional[str]
-    tool_name: Optional[str]          # Name of the tool to call (e.g., "book_appointment", "get_appointments")
-    requested_weekday: Optional[int] = None  # 0 = Monday ... 6 = Sunday
+    tool_name: Optional[str]
+    requested_weekday: Optional[int]
 
     # --- Tool outputs ---
-    appointments_output: Optional[str]       # Result from get_appointments
-    booking_confirmation: Optional[str]      # Result from book_appointment_tool
+    appointments_output: Optional[str]
+    booking_confirmation: Optional[str]
 
-    # --- Final agent output ---
-    final_answer: Optional[str]              # Natural language response from LLM
+    # --- Final answer ---
+    final_answer: Optional[str]
+
+    # ✅ New for memory
+    identity: Optional[str]  # like a user ID or session ID
+    chat_history: Optional[List[BaseMessage]]  # short-term memory for planner context
 
     REQUIRED_FIELDS = ["doctor_name", "patient_name", "branch_id", "service_name", "start_time", "end_time"]
