@@ -17,6 +17,7 @@ from agent.tools.appointment import (
     summarize_calendar_today,
 )
 
+
 # FastAPI app
 app = FastAPI()
 

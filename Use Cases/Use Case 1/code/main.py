@@ -40,14 +40,14 @@ class AgentStateRequest(BaseModel):
 @app.post("/invoke")
 async def invoke_agent(request: AgentStateRequest):
     input_state = request.state
-    print("📥 Received state:", input_state)
+    print("Received state:", input_state)
 
     try:
         result = doctor_agent_executor.invoke(input_state)
-        print("✅ Agent result:", result)
+        print("Agent result:", result)
         return result
     except Exception as e:
-        print("❌ Agent failed:", e)
+        print("Agent failed:", e)
         return {"error": str(e)}
 
 # -----------------------------
@@ -65,6 +65,6 @@ if __name__ == "__main__":
     missing = [var for var in required_vars if not os.environ.get(var)]
 
     if missing:
-        print(f"❌ Missing Azure OpenAI env vars: {missing}")
+        print(f"Missing Azure OpenAI env vars: {missing}")
     else:
         uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

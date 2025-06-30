@@ -17,4 +17,4 @@ def call_mcp_tool(tool_name: str, input_dict: dict) -> str:
         result = response.json()
         return result if isinstance(result, str) else str(result)
     except Exception as e:
-        return f"❌ MCP tool '{tool_name}' failed: {e}"
+        return f"MCP tool '{tool_name}' failed: {e}"
