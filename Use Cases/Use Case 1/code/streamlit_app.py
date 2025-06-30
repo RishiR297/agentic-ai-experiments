@@ -29,6 +29,27 @@ if "agent_state" not in st.session_state:
 st.title("🤖 Doctor Appointment Agent")
 st.markdown("Ask anything about appointments, doctors, or bookings.")
 
+# Trigger welcome message on initial load
+if not st.session_state["agent_state"].get("chat_history"):
+    try:
+        with st.spinner("Initializing..."):
+            response = requests.post(BACKEND_URL, json={"state": st.session_state["agent_state"]})
+            response.raise_for_status()
+            result = response.json()
+            st.session_state["agent_state"] = result
+
+            # ✅ Add welcome message to chat history
+            if result.get("final_answer"):
+                st.session_state["agent_state"]["chat_history"].append({
+                    "type": "ai",
+                    "content": result["final_answer"]
+                })
+
+    except Exception as e:
+        st.error("Failed to load welcome message")
+        st.text(traceback.format_exc())
+
+
 # -----------------------------
 # Display Chat History
 # -----------------------------
@@ -37,6 +58,9 @@ for msg in st.session_state["agent_state"].get("chat_history", []):
         st.markdown(msg["content"])
 
 user_input = st.chat_input("How can I help you today?")
+if user_input:
+    st.chat_message("user").markdown(user_input)  # Show immediately
+
 
 # -----------------------------
 # Serializer
@@ -54,7 +78,7 @@ def serialize_result(result):
         else:
             return str(result)
     except Exception as e:
-        print("❌ Serialization error:", e)
+        print("Serialization error:", e)
         print("Offending object type:", type(result))
         traceback.print_exc()
         raise
@@ -78,13 +102,7 @@ if user_input:
 
             final_answer = result.get("final_answer", "🤖 No answer produced.")
 
-            # Append to chat history
-            st.session_state["agent_state"]["chat_history"].append(
-                {"type": "human", "content": user_input}
-            )
-            st.session_state["agent_state"]["chat_history"].append(
-                {"type": "ai", "content": final_answer}
-            )
+            pass
 
             # Show assistant reply
             with st.chat_message("assistant"):
@@ -121,4 +139,5 @@ if st.button("🧹 Reset Agent"):
         "chat_history": [],
         "identity": "user_001"
     }
+    st.rerun()
     st.success("Agent memory reset!")
