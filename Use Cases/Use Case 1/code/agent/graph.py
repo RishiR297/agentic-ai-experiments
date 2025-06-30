@@ -9,11 +9,19 @@ from agent.nodes import (
     call_tool_node,
     generate_final_answer,
     ask_for_missing_fields_node,
-    respond_naturally_node  # ✅ New node added
+    respond_naturally_node
 )
 
-# Helper for routing
-path_fn = RunnableLambda(lambda state: state["next"])
+# -----------------------------
+# Router Function
+# -----------------------------
+def route_decision(state: dict) -> str:
+    """
+    Determine the next step based on the planner output.
+    """
+    return state.get("next", "answer")  # Fallback to 'answer'
+
+path_fn = RunnableLambda(route_decision)
 path_fn.name = "router_decision"
 
 # -----------------------------
@@ -21,40 +29,39 @@ path_fn.name = "router_decision"
 # -----------------------------
 graph = StateGraph(dict)
 
-# Define all nodes
+# 1. Add nodes
 graph.add_node("welcome", welcome_node)
-graph.add_node("planner", planner_node)                     # LLM decides next action
-graph.add_node("router", route_node)                        # Chooses branch: ask, tool, or finish
-graph.add_node("respond", respond_naturally_node)           # ✅ Gives natural response before tool
-graph.add_node("tool", call_tool_node)                      # Executes the tool
-graph.add_node("answer", generate_final_answer)             # Formats final output
+graph.add_node("planner", planner_node)
+graph.add_node("router", route_node)
+graph.add_node("tool", call_tool_node)
+graph.add_node("respond", respond_naturally_node)
 graph.add_node("ask_missing_info", ask_for_missing_fields_node)
+graph.add_node("answer", generate_final_answer)
 
-# Entry point
+# 2. Define entry
 graph.set_entry_point("welcome")
 graph.add_edge("welcome", "planner")
 graph.add_edge("planner", "router")
 
-# Router logic: decide next step
+# 3. Conditional routing from router
 graph.add_conditional_edges(
     source="router",
     path=path_fn,
     path_map={
-        "tool": "tool",                # ✅ New: respond naturally before calling tool
-        "answer": "answer",
-        "ask_missing_info": "ask_missing_info"
+        "tool": "tool",
+        "ask_missing_info": "ask_missing_info",
+        "answer": "answer"
     }
 )
 
-# ✅ New edge: respond first → then tool
-graph.add_edge("tool", "respond")    # ✅ goes from tool → respond
+# 4. Tool flows to natural response
+graph.add_edge("tool", "respond")
+graph.add_edge("respond", "answer")
 
-graph.add_edge("respond", "answer")  # ✅ This is the correct final transition
-
-# Also go to answer after asking for missing fields
+# 5. Ask_missing_info also ends at answer
 graph.add_edge("ask_missing_info", "answer")
 
-# Finish node
+# 6. Final output
 graph.set_finish_point("answer")
 
 # -----------------------------
