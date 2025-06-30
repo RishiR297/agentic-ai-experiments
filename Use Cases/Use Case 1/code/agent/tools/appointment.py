@@ -194,9 +194,9 @@ def create_appointment(
             'Pending'
         ))
         conn.commit()
-        return f"✅ Appointment booked successfully with Dr. {doctor_name} at Branch {branch_id} from {start_time} to {end_time} for {patient_name}."
+        return f"Appointment booked successfully with Dr. {doctor_name} at Branch {branch_id} from {start_time} to {end_time} for {patient_name}."
     except Exception as e:
-        return f"❌ Failed to book appointment: {e}"
+        return f"Failed to book appointment: {e}"
     finally:
         conn.close()
 
@@ -228,7 +228,7 @@ def book_appointment_tool(
     conn.close()
 
     if not match:
-        return f"❌ No doctor found matching '{doctor_name}'"
+        return f"No doctor found matching '{doctor_name}'"
 
     doctor_id = match[0]
     full_name = f"{match[1]} {match[2]}"
@@ -238,7 +238,7 @@ def book_appointment_tool(
         suggestions = suggest_appointment_slots(doctor_name=full_name, after=start_time)
         suggestion_list = "\n".join(suggestions)
         return (
-            f"❌ Dr. {full_name} is not available from {start_time} to {end_time}.\n"
+            f"Dr. {full_name} is not available from {start_time} to {end_time}.\n"
             "Here are some upcoming available slots:\n" + suggestion_list
         )
 
@@ -299,7 +299,7 @@ def suggest_appointment_slots(
     row = cursor.fetchone()
     if not row:
         conn.close()
-        return f"❌ Could not find doctor matching '{doctor_name}'"
+        return f" Could not find doctor matching '{doctor_name}'"
     doctor_id = row[0]
 
     # Step 2: Get working schedule
@@ -312,7 +312,7 @@ def suggest_appointment_slots(
 
     if not schedule:
         conn.close()
-        return f"❌ No active schedule found for doctor with ID {doctor_id}"
+        return f" No active schedule found for doctor with ID {doctor_id}"
 
     weekday_schedule_map = {int(wd): (from_t, to_t) for wd, from_t, to_t in schedule}
 
@@ -381,7 +381,7 @@ def suggest_appointment_slots(
     conn.close()
 
     if not results:
-        return "❌ No available slots found in the next two weeks."
+        return " No available slots found in the next two weeks."
     return "\n".join(results)
 
 
