@@ -3,4 +3,4 @@
 Run:
 <code> 
 cd '.\Use Cases\Use Case 1\code\'
-python main.py </code>
+npm run dev </code>
