@@ -21,6 +21,7 @@ class AgentState(TypedDict, total=False):
     # --- Tool outputs ---
     appointments_output: Optional[str]
     booking_confirmation: Optional[str]
+    available_slot_lines: Optional[List[str]] 
 
     # --- Final answer ---
     final_answer: Optional[str]
