@@ -16,11 +16,18 @@ from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
+from tools.doctor import get_branch_id_for_doctor, get_services_for_doctor, is_service_valid_for_doctor, suggest_doctor_for_service
 from agent.tools.mcp_client import call_mcp_tool
 
 
 load_dotenv()
 print("Loaded nodes.py at runtime")
+
+# Safe conversion to avoid serialization errors
+SAFE_TOOL_REGISTRY = [
+    tool if isinstance(tool, dict) else tool.dict() for tool in MCP_TOOL_REGISTRY
+]
+
 
 # Azure OpenAI LLM setup
 llm_with_tools = AzureChatOpenAI(
@@ -29,8 +36,7 @@ llm_with_tools = AzureChatOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_version="2024-02-15-preview",
-    model_kwargs={"tools": MCP_TOOL_REGISTRY}
-
+    model_kwargs={"tools": SAFE_TOOL_REGISTRY}
 )
 
 # LLM without tools for prompting tasks like slot-filling
@@ -84,8 +90,9 @@ def extract_slots(user_input: str) -> dict:
             if "weekday" in extracted:
                 now = datetime.now()
                 weekday = extracted["weekday"]
-                days_ahead = (weekday - now.weekday() + 7) % 7 or 7
-                next_date = datetime.combine(now.date() + timedelta(days=days_ahead), datetime.min.time())
+                days_ahead = (weekday - now.weekday() + 7) % 7
+                next_date = now + timedelta(days=days_ahead)
+
                 extracted["after"] = next_date.isoformat()
                 print("Interpreted weekday as:", next_date.date())
 
@@ -159,15 +166,20 @@ def planner_node(state: dict) -> dict:
     # ----------------------------------------
     extracted_fields = {}
     should_extract = not state.get("awaiting_confirmation") and not state.get("available_slot_lines")
-    
+
     if should_extract:
         try:
             extracted_fields = extract_slots(user_input)
             extracted_fields.setdefault("patient_name", "User")
             state.update(extracted_fields)
-            print("Extracted fields:", extracted_fields)
         except Exception as e:
             print(f"extract_slots failed: {e}")
+
+    # Autofill branch_id if missing but doctor known
+    if state.get("doctor_name") and not state.get("branch_id"):
+        inferred_branch_id = get_branch_id_for_doctor(state["doctor_name"])
+        if inferred_branch_id:
+            state["branch_id"] = inferred_branch_id
 
     # Clear previous outputs
     state.pop("final_answer", None)
@@ -177,49 +189,43 @@ def planner_node(state: dict) -> dict:
     # 🔁 Step 2: Handle booking confirmation
     # ----------------------------------------
     if state.get("awaiting_confirmation"):
-        print(f"[DEBUG planner_node] awaiting_confirmation=True, user_input='{user_input}'")
         user_input_lower = user_input.lower()
-
         if user_input_lower in ["yes", "yeah", "yep", "confirm", "go ahead", "sure"]:
-            print("[DEBUG planner_node] User confirmed booking.")
+            # Confirm booking
             state["intermediate_steps"] = [state.pop("proposed_booking")]
             state["awaiting_confirmation"] = False
-
-            # Clean up any temporary fields
-            state.pop("start_time", None)
-            state.pop("end_time", None)
             return state
         else:
-            print("[DEBUG planner_node] User did not confirm booking; cancelling.")
+            # Cancel booking
             state["awaiting_confirmation"] = False
             state.pop("proposed_booking", None)
             state.pop("start_time", None)
             state.pop("end_time", None)
             state["final_answer"] = "Okay, booking cancelled. Let me know if you'd like to try a different slot."
-            return {
-                **state,
-                "next": "answer"
-            }
+            state.pop("available_slot_lines", None)
+
+            return {**state, "next": "answer"}
 
     # ----------------------------------------
     # 🗓️ Step 3: Detect slot selection
     # ----------------------------------------
-    chat_history = state.get("chat_history", [])[-6:]
-    chat_history.append(HumanMessage(content=user_input))
-
     selected = detect_selected_slot(state)
-    print(f"[DEBUG planner_node] detect_selected_slot returned: {selected}")
-
     if selected:
-        print("[DEBUG planner_node] User selected a slot directly.")
-
+        # User selected a slot -> prepare confirmation
         start_time = selected.get("start_time")
         end_time = selected.get("end_time")
         doctor = state.get("doctor_name", "the doctor")
         patient = state.get("patient_name", "User")
 
+        # 🔁 Autofill missing branch ID now based on doctor
+        if not state.get("branch_id") and doctor:
+            inferred_branch_id = get_branch_id_for_doctor(doctor)
+            print(f"[DEBUG autofill] Inferred branch ID for {doctor}: {inferred_branch_id}")
+            if inferred_branch_id:
+                state["branch_id"] = inferred_branch_id
+
         state["awaiting_confirmation"] = True
-        state["start_time"] = start_time  # ✅ store for easier access later
+        state["start_time"] = start_time
         state["end_time"] = end_time
 
         state["proposed_booking"] = {
@@ -233,8 +239,7 @@ def planner_node(state: dict) -> dict:
                 "service_name": state.get("service_name"),
             },
         }
-
-
+        state.pop("available_slot_lines", None)
         readable_time = datetime.fromisoformat(start_time).strftime("%A, %b %d at %H:%M") if start_time else "[unknown time]"
         state["final_answer"] = (
             f"You selected the slot on {readable_time} with {doctor}.\n"
@@ -243,7 +248,7 @@ def planner_node(state: dict) -> dict:
 
         return {
             **state,
-            "chat_history": chat_history,
+            "chat_history": state.get("chat_history", [])[-6:] + [HumanMessage(content=user_input)],
             "next": "answer",
         }
 
@@ -251,10 +256,26 @@ def planner_node(state: dict) -> dict:
     # ----------------------------------------
     # 🤖 Step 4: Fallback to LLM planner
     # ----------------------------------------
+    
+    if not state.get("awaiting_confirmation"):
+        # Build tool call for suggesting slots if doctor_name & weekday known
+        if "doctor_name" in state and "weekday" in state:
+            state["intermediate_steps"] = [{
+                "tool_name": "suggest_appointment_slots",
+                "args": {
+                    "doctor_name": state["doctor_name"],
+                    "weekday": state["weekday"]
+                }
+            }]
+            return state
+        
+        
     system_prompt = SystemMessage(
         content="You are a helpful assistant. Use the available tools to assist the user."
     )
+    chat_history = state.get("chat_history", [])[-6:]
     messages: list[BaseMessage] = [system_prompt] + chat_history
+
 
     response = llm_with_tools.invoke(messages)
 
@@ -368,51 +389,67 @@ def respond_naturally_node(state: dict) -> dict:
     message = ""
     
     if state.get("awaiting_confirmation"):
-        # Planner node already set final_answer with confirmation message
+        # Prevent overwriting planner node's confirmation message
         return state
 
     if tool_name == "suggest_appointment_slots":
         tool_results = state.get("tool_results", [])
         slots_text = tool_results[0] if tool_results else ""
         lines = slots_text.splitlines()
-        available_lines = []
+        available_slots = []
 
+        weekday_name = None
         if weekday is not None:
             weekday_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][weekday]
 
-            for line in lines:
-                try:
-                    cleaned = clean_date_line(line)
-                    date_part = cleaned.split(":")[0].strip()
-                    date_with_year = f"{date_part} {datetime.now().year}"
-                    parsed_date = datetime.strptime(date_with_year, "%A, %b %d %Y")
+        for line in lines:
+            try:
+                cleaned = clean_date_line(line)
+                date_part = cleaned.split(":")[0].strip()
+                date_with_year = f"{date_part} {datetime.now().year}"
+                parsed_date = datetime.strptime(date_with_year, "%A, %b %d %Y")
 
-                    if parsed_date.weekday() == weekday:
-                        available_lines.append(line)
-                except Exception:
-                    if weekday_name in line:
-                        available_lines.append(line)
+                if weekday is None or parsed_date.weekday() == weekday:
+                    slot_info = parse_slot_line(line)
+                    if slot_info:
+                        available_slots.append({
+                            "start_time": slot_info["start_time"],
+                            "end_time": slot_info["end_time"],
+                            "display": line
+                        })
+            except Exception:
+                available_slots.append({
+                    "start_time": None,
+                    "end_time": None,
+                    "display": line
+                })
 
-            if available_lines:
-                message = (
-                    f"Yes, Dr. {doctor} is available on {weekday_name}. Here are the time slots:\n\n"
-                    + "\n".join(available_lines)
-                    + "\n\nWhich slot would you like to book?"
-                )
-
-                # ⬇️ Save available slots to state for later matching
-                state["available_slot_lines"] = available_lines
-            else:
-                message = f"Dr. {doctor} is not available on {weekday_name}. But here are some nearby available slots:\n\n" + slots_text
+        if available_slots:
+            message = (
+                f"Yes, Dr. {doctor} is available"
+                + (f" on {weekday_name}" if weekday_name else "")
+                + ". Here are the time slots:\n\n"
+                + "\n".join([slot["display"] for slot in available_slots])
+                + "\n\nWhich slot would you like to book?"
+            )
+            state["available_slot_lines"] = available_slots
         else:
-            message = f"Let me check available time slots for Dr. {doctor}.\n\n" + slots_text
+            if weekday_name:
+                message = (
+                    f"Dr. {doctor} is not available on {weekday_name}. "
+                    "But here are some nearby available slots:\n\n"
+                    + slots_text
+                )
+            else:
+                message = f"Let me check available time slots for Dr. {doctor}.\n\n" + slots_text
+
 
         state["tool_results"] = []  # Clear to prevent re-display in final serializer
 
     elif tool_name == "book_appointment_tool":
         message = f"Booking your {service} with Dr. {doctor}. One moment..."
 
-    elif tool_name == "get_appointments":
+    elif tool_name == "appointments":
         message = f"Fetching current appointments for Dr. {doctor}."
 
     else:
@@ -482,7 +519,16 @@ def call_tool_node(state: dict) -> dict:
                 appointments_output = result
 
         except Exception as e:
-            results.append(f"Error calling MCP tool '{tool_name}': {e}")
+            import traceback
+            print(f"[ERROR] Tool '{tool_name}' failed:", e)
+            traceback.print_exc()
+
+            user_friendly_msg = (
+                f"❌ Something went wrong while trying to use `{tool_name}`. "
+                f"Please try again later or modify your request."
+            )
+            results.append(user_friendly_msg)
+
 
 
     return {
@@ -502,33 +548,40 @@ def detect_selected_slot(state: dict) -> dict:
     Returns a dict with start_time and end_time if match is found.
     """
     user_input = state.get("user_input", "").lower()
-    slot_lines = state.get("available_slot_lines", [])
+    slot_lines = state.get("available_slot_lines", [])  # Now a list of dicts
     print(f"[DEBUG detect_selected_slot] user_input: '{user_input}'")
     print(f"[DEBUG detect_selected_slot] available slots: {slot_lines}")
-    # Handle numeric references like "first", "second", etc.
+
     ordinal_map = {
         "first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
         "1st": 0, "2nd": 1, "3rd": 2, "4th": 3, "5th": 4
     }
+    # Match ordinal words like "first slot"
     for word, idx in ordinal_map.items():
         if word in user_input and idx < len(slot_lines):
             print(f"[DEBUG detect_selected_slot] Matched ordinal '{word}' to slot index {idx}")
-            parsed_slot = parse_slot_line(slot_lines[idx])
-            print(f"[DEBUG detect_selected_slot] Parsed slot: {parsed_slot}")
-            return parsed_slot
+            return {
+                "start_time": slot_lines[idx]["start_time"],
+                "end_time": slot_lines[idx]["end_time"]
+            }
 
-    # Try matching a date mentioned in the user input (e.g. "July 7")
-    for line in slot_lines:
-        try:
-            # Match something like "Jul 07: 10:00 - 18:00"
-            match = re.search(r"(\w{3,}) (\d{1,2})[:|,]?\s*(\d{1,2}:\d{2}) - (\d{1,2}:\d{2})", line)
-            if match:
-                month_str, day_str, start_t, end_t = match.groups()
-                combined_date = f"{month_str} {day_str}"
-                if combined_date.lower() in user_input:
-                    return parse_slot_line(line)
-        except:
-            continue
+    # Match date phrases like "July 7"
+    for slot in slot_lines:
+        display = slot.get("display", "").lower()
+        # We'll try matching month and day from user input against display
+        # Extract month and day from user input
+        # For simplicity, regex find all month/day combos in user input
+        import re
+        date_matches = re.findall(r"(\b\w{3,9}) (\d{1,2})(?:st|nd|rd|th)?", user_input)
+        for (month_str, day_str) in date_matches:
+            for suffix in ["", "st", "nd", "rd", "th"]:
+                date_phrase = f"{month_str} {int(day_str)}{suffix}".lower()
+                if date_phrase in display:
+                    print(f"[DEBUG detect_selected_slot] Matched date phrase '{date_phrase}' in slot: {display}")
+                    return {
+                        "start_time": slot["start_time"],
+                        "end_time": slot["end_time"]
+                    }
 
     print("[DEBUG detect_selected_slot] No slot matched.")
     return {}
@@ -548,6 +601,7 @@ def parse_slot_line(line: str) -> dict:
         slot_date = date_parser.parse(f"{month} {day} {base_year}")
         if slot_date.date() < now.date():
             slot_date = date_parser.parse(f"{month} {day} {base_year + 1}")
+
 
         start_dt = datetime.combine(slot_date.date(), datetime.strptime(start_t, "%H:%M").time())
         end_dt = datetime.combine(slot_date.date(), datetime.strptime(end_t, "%H:%M").time())
