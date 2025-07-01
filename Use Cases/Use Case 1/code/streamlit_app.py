@@ -29,21 +29,39 @@ if "agent_state" not in st.session_state:
 st.title("🤖 Doctor Appointment Agent")
 st.markdown("Ask anything about appointments, doctors, or bookings.")
 
-# Trigger welcome message on initial load
+def safe_post(url, payload, retries=3):
+    for attempt in range(retries):
+        try:
+            return requests.post(url, json=payload, timeout=5)
+        except requests.exceptions.ConnectionError as e:
+            if attempt < retries - 1:
+                import time
+                time.sleep(1)  # wait a second before retry
+            else:
+                raise e
+
 if not st.session_state["agent_state"].get("chat_history"):
     try:
         with st.spinner("Initializing..."):
-            response = requests.post(BACKEND_URL, json={"state": st.session_state["agent_state"]})
+            response = safe_post(BACKEND_URL, st.session_state["agent_state"])
+
             response.raise_for_status()
             result = response.json()
-            st.session_state["agent_state"] = result
 
-            # ✅ Add welcome message to chat history
+            # ✅ Ensure chat_history exists
+            if "chat_history" not in result:
+                result["chat_history"] = []
+
+            # ✅ Add welcome message if available
             if result.get("final_answer"):
-                st.session_state["agent_state"]["chat_history"].append({
+                result["chat_history"].append({
                     "type": "ai",
                     "content": result["final_answer"]
                 })
+
+            # ✅ Save back to session
+            st.session_state["agent_state"] = result
+
 
     except Exception as e:
         st.error("Failed to load welcome message")
@@ -93,7 +111,7 @@ if user_input:
             state["user_input"] = user_input
 
             # 🔁 POST to FastAPI
-            response = requests.post(BACKEND_URL, json={"state": state})
+            response = requests.post(BACKEND_URL, json=state)
             response.raise_for_status()
             result = response.json()
 
