@@ -37,18 +37,16 @@ class AgentStateRequest(BaseModel):
 # -----------------------------
 # Agent Invoke Endpoint
 # -----------------------------
+# Backend receive handler
 @app.post("/invoke")
-async def invoke_agent(request: AgentStateRequest):
-    input_state = request.state
-    print("Received state:", input_state)
+async def invoke(state: dict):
+    if "user_input" not in state:
+        print("Received state missing user_input")
+        return {"error": "Missing 'user_input' in agent state"}
+    
+    result = doctor_agent_executor.invoke(state)
+    return result
 
-    try:
-        result = doctor_agent_executor.invoke(input_state)
-        print("Agent result:", result)
-        return result
-    except Exception as e:
-        print("Agent failed:", e)
-        return {"error": str(e)}
 
 # -----------------------------
 # Health Check
