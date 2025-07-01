@@ -49,6 +49,67 @@ def list_all_doctors():
     return doctors
 
 
+def get_branch_id_for_doctor(doctor_name: str) -> int | None:
+    """
+    Looks up the branch_id for a given doctor from the view_appointments view.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Strip "Dr." prefix and lowercase everything for a relaxed match
+    clean_name = doctor_name.replace("Dr.", "").strip().lower()
+
+    cursor.execute("""
+        SELECT BranchId
+        FROM View_Appointments
+        WHERE LOWER(DoctorName) LIKE ?
+        LIMIT 1
+    """, (f"%{clean_name}%",))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return row[0] if row else None
+
+def get_services_for_doctor(doctor_name: str) -> list[str]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DISTINCT ServiceName
+        FROM View_Appointments
+        WHERE DoctorName LIKE ?
+    """, (f"%{doctor_name}%",))
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows if row[0]]
+
+
+def is_service_valid_for_doctor(doctor_name: str, service_name: str) -> bool:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM View_Appointments
+        WHERE DoctorName LIKE ? AND ServiceName = ?
+    """, (f"%{doctor_name}%", service_name))
+    result = cursor.fetchone()[0]
+    conn.close()
+    return result > 0
+
+
+def suggest_doctor_for_service(service_name: str) -> list[str]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DISTINCT DoctorName
+        FROM View_Appointments
+        WHERE ServiceName = ?
+    """, (service_name,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows if row[0]]
+
+
 # -----------------------------
 # Test Block
 # -----------------------------
