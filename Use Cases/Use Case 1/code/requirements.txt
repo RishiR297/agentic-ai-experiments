@@ -1,0 +1,35 @@
+# Core dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# LangChain and AI
+langchain==0.1.0
+langchain-openai==0.0.2
+langchain-core==0.1.0
+langgraph==0.0.26
+
+# Azure OpenAI
+openai==1.6.1
+
+# Database
+sqlite3
+
+# Utilities
+python-dotenv==1.0.0
+python-dateutil==2.8.2
+
+# Web interface
+streamlit==1.29.0
+
+# HTTP client
+httpx==0.25.2
+requests==2.31.0
+
+# CORS middleware
+python-multipart==0.0.6
+
+# Development (optional)
+pytest==7.4.3
+black==23.11.0
+flake8==6.1.0
