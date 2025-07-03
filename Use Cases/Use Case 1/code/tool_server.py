@@ -1,9 +1,28 @@
 # ============================================
 # File: tool_server.py
-# Purpose: FastAPI server to expose tools via HTTP (MCP-style)
+# Purpose: FastAPI server to expose appointment tools via HTTP (MCP-style)
+#
+# This server provides HTTP endpoints for all appointment-related tools,
+# following the Model Context Protocol (MCP) specification. It serves as
+# a microservice that the main agent can call to perform specific actions
+# like booking appointments, checking availability, and managing schedules.
+#
+# Key Features:
+# - MCP-compliant tool registry with OpenAI function calling schema
+# - Proper argument validation and filtering for each tool
+# - Error handling and informative responses
+# - Support for all core appointment operations
+#
+# Endpoints:
+# - /tools/book_appointment_tool: Book new appointments
+# - /tools/get_appointments: Retrieve existing appointments
+# - /tools/suggest_appointment_slots: Find available time slots
+# - /tools/get_earliest_available_slot: Get earliest availability
+# - /tools/get_next_client_info: Next patient information
+# - /tools/summarize_calendar_today: Daily schedule summary
 # ============================================
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
@@ -151,29 +170,60 @@ class ToolRequest(BaseModel):
 # -----------------------------
 @app.post("/tools/book_appointment_tool")
 def call_book_appointment(req: ToolRequest):
-    return book_appointment_tool(req.model_dump(exclude_none=True))
+    # Validate required fields explicitly for this tool
+    print("📥 Incoming booking payload:", req.dict())
+    required_fields = ["doctor_name", "patient_name", "branch_id", "service_name", "start_time", "end_time"]
+    missing = [f for f in required_fields if getattr(req, f) is None]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
+    
+    # Only pass the fields that book_appointment_tool expects
+    booking_args = {
+        "doctor_name": req.doctor_name,
+        "patient_name": req.patient_name,
+        "branch_id": req.branch_id,
+        "service_name": req.service_name,
+        "start_time": req.start_time,
+        "end_time": req.end_time
+    }
+    print("📥 Filtered booking payload:", booking_args)
+    return book_appointment_tool(**booking_args)
 
 
 @app.post("/tools/get_appointments")
 def call_get_appointments(req: ToolRequest):
-    return get_appointments(req.model_dump(exclude_none=True))
+    # doctor_name is required
+    if not req.doctor_name:
+        raise HTTPException(status_code=400, detail="Missing required field: doctor_name")
+    args = req.model_dump(exclude_none=True)
+    return get_appointments(**args)
 
 
 @app.post("/tools/suggest_appointment_slots")
 def call_suggest_slots(req: ToolRequest):
-    return suggest_appointment_slots(**req.model_dump(exclude_none=True))
+    if not req.doctor_name:
+        raise HTTPException(status_code=400, detail="Missing required field: doctor_name")
+    args = req.model_dump(exclude_none=True)
+    return suggest_appointment_slots(**args)
 
 
 @app.post("/tools/get_earliest_available_slot")
 def call_earliest_slot(req: ToolRequest):
-    return get_earliest_available_slot(req.model_dump(exclude_none=True))
+    if not req.doctor_name:
+        raise HTTPException(status_code=400, detail="Missing required field: doctor_name")
+    return get_earliest_available_slot(req.doctor_name)
 
 
 @app.post("/tools/get_next_client_info")
 def call_next_client(req: ToolRequest):
-    return get_next_client_info(req.model_dump(exclude_none=True))
+    if not req.doctor_name:
+        raise HTTPException(status_code=400, detail="Missing required field: doctor_name")
+    return get_next_client_info(req.doctor_name)
 
 
 @app.post("/tools/summarize_calendar_today")
 def call_calendar_summary(req: ToolRequest):
-    return summarize_calendar_today(req.model_dump(exclude_none=True))
+    if not req.doctor_name:
+        raise HTTPException(status_code=400, detail="Missing required field: doctor_name")
+    return summarize_calendar_today(req.doctor_name)
+
