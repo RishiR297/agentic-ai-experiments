@@ -1,6 +1,21 @@
 # ==============================================
 # File: main.py
 # Purpose: FastAPI server to expose the doctor appointment agent via HTTP
+# 
+# This is the main entry point for the doctor appointment booking system.
+# It provides a REST API that wraps the LangGraph agent functionality,
+# allowing external applications (like Streamlit) to interact with the
+# appointment booking logic through HTTP requests.
+#
+# Key endpoints:
+# - POST /invoke: Main agent interaction endpoint
+# - GET /health: Health check for monitoring
+#
+# The agent handles:
+# - Natural language appointment requests
+# - Doctor availability checking
+# - Appointment slot suggestions
+# - Complete booking workflows
 # ==============================================
 
 import os
@@ -27,6 +42,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -----------------------------
+# Request/Response Models
+# -----------------------------
+class ChatRequest(BaseModel):
+    """
+    Request model for agent interaction.
+    
+    Attributes:
+        user_input (str): The user's natural language input
+        chat_history (list, optional): Previous conversation history
+    """
+    user_input: str
+    chat_history: list = []
+
+class ChatResponse(BaseModel):
+    """
+    Response model for agent interaction.
+    
+    Attributes:
+        response (str): The agent's response to the user
+        state (dict): Current agent state for debugging/monitoring
+    """
+    response: str
+    state: dict
 
 # -----------------------------
 # Request Model
