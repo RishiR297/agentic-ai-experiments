@@ -1,11 +1,37 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-env/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
 venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables
 .env
+.env.local
+.env.production
 *.env
 
 # Node.js
@@ -18,20 +44,54 @@ yarn-error.log*
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
 # Logs
 logs/
 *.log
 
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Test files
+test_*.py
+*_test.py
+debug_*.py
+check_*.py
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
 # Streamlit cache
 .streamlit/
 
 # Python bytecode
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
 
-# Other
-*.sqlite3
-
+# Project-specific exclusions
 /demo_use_case
 /new_use_case
