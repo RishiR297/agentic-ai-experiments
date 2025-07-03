@@ -6,7 +6,37 @@
 # -----------------------------
 # Imports
 # -----------------------------
+import re
 from utils.db import get_db_connection
+
+
+# -----------------------------
+# Function: Doctor Name Processing
+# -----------------------------
+def process_doctor_name(name: str, for_display: bool = True) -> str:
+    """
+    Process doctor name for either display or database lookup.
+    
+    Args:
+        name: The doctor name to process
+        for_display: If True, formats for display ("Dr. Name"). 
+                    If False, cleans for database lookup ("name")
+    
+    Returns:
+        Processed doctor name
+    """
+    if not name:
+        return name
+    
+    # Remove common prefixes (case insensitive) - handles "doctor", "Dr.", "dr", etc.
+    clean_name = re.sub(r'^(dr\.?\s*|doctor\s*)', '', name, flags=re.IGNORECASE).strip()
+    
+    if for_display:
+        # Format for user-facing display
+        return f"Dr. {clean_name.title()}"
+    else:
+        # Format for database lookup
+        return clean_name.lower()
 
 
 # -----------------------------
@@ -56,8 +86,8 @@ def get_branch_id_for_doctor(doctor_name: str) -> int | None:
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Strip "Dr." prefix and lowercase everything for a relaxed match
-    clean_name = doctor_name.replace("Dr.", "").strip().lower()
+    # Use the centralized cleaning function
+    clean_name = process_doctor_name(doctor_name, for_display=False)
 
     cursor.execute("""
         SELECT BranchId
