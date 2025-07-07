@@ -115,13 +115,16 @@ def get_services_for_doctor(doctor_name: str) -> list[str]:
 
 
 def is_service_valid_for_doctor(doctor_name: str, service_name: str) -> bool:
+    # Extract clean name without "Dr." prefix for database lookup
+    clean_name = process_doctor_name(doctor_name, for_display=False)
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT COUNT(*)
         FROM View_Appointments
         WHERE DoctorName LIKE ? AND ServiceName = ?
-    """, (f"%{doctor_name}%", service_name))
+    """, (f"%{clean_name}%", service_name))
     result = cursor.fetchone()[0]
     conn.close()
     return result > 0
