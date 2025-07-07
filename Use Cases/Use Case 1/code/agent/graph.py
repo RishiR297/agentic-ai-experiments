@@ -5,7 +5,6 @@ from langchain_core.runnables import RunnableLambda
 from agent.nodes import (
     welcome_node,
     planner_node,
-    route_node,
     call_tool_node,
     generate_final_answer,
     ask_for_missing_fields_node,
@@ -32,36 +31,37 @@ graph = StateGraph(dict)
 # 1. Add nodes
 graph.add_node("welcome", welcome_node)
 graph.add_node("planner", planner_node)
-graph.add_node("router", route_node)
 graph.add_node("tool", call_tool_node)
 graph.add_node("respond", respond_naturally_node)
 graph.add_node("ask_missing_info", ask_for_missing_fields_node)
 graph.add_node("answer", generate_final_answer)
 
 # 2. Define entry
-graph.set_entry_point("welcome")
-graph.add_edge("welcome", "planner")
-graph.add_edge("planner", "router")
+graph.set_entry_point("planner")
 
-# 3. Conditional routing from router
+# 3. Conditional routing from planner
 graph.add_conditional_edges(
-    source="router",
+    source="planner",
     path=path_fn,
     path_map={
+        "welcome": "welcome",
         "tool": "tool",
-        "ask_missing_info": "ask_missing_info",
+        "ask_missing_info": "ask_missing_info", 
         "answer": "answer"
     }
 )
 
-# 4. Tool flows to natural response
+# 4. Welcome goes to answer (for displaying the welcome message)
+graph.add_edge("welcome", "answer")
+
+# 5. Tool flows to natural response  
 graph.add_edge("tool", "respond")
 graph.add_edge("respond", "answer")
 
-# 5. Ask_missing_info also ends at answer
+# 6. Ask_missing_info also ends at answer
 graph.add_edge("ask_missing_info", "answer")
 
-# 6. Final output
+# 7. Final output
 graph.set_finish_point("answer")
 
 # -----------------------------
