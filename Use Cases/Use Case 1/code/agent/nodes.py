@@ -57,7 +57,7 @@ SAFE_TOOL_REGISTRY = [
 ]
 
 # Sensitive tools that require special access
-SENSITIVE_TOOLS = {"get_next_client_info", "summarize_appointments"}
+SENSITIVE_TOOLS = {"get_next_client_info", "summarize_calendar_today"}
 
 # Azure OpenAI LLM setup
 llm_with_tools = AzureChatOpenAI(
@@ -99,6 +99,67 @@ for tool in MCP_TOOL_REGISTRY:
 # ===============================================
 # UTILITY FUNCTIONS
 # ===============================================
+
+def authenticate_doctor(doctor_name: str, doctor_id: str) -> dict:
+    """
+    Authenticate doctor credentials against the database.
+    Returns dict with success status and doctor info.
+    Accepts either full GUID or just the first section before the hyphen.
+    """
+    try:
+        from utils.db import get_db_connection
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        print(f"[DEBUG] Authenticating: name='{doctor_name}', id='{doctor_id}'")
+        
+        # Query to verify doctor exists with given name and ID
+        # Support both full GUID and first section of GUID
+        # Clean doctor name by removing "Dr." prefix if present
+        clean_name = doctor_name.replace("Dr.", "").strip()
+        
+        cursor.execute("""
+            SELECT UserId, Firstname, Lastname, SpecialtyId, DisplayName, IsActive
+            FROM COR_Doctor 
+            WHERE (LOWER(Firstname || ' ' || Lastname) LIKE LOWER(?) 
+                   OR LOWER(DisplayName) LIKE LOWER(?)
+                   OR LOWER(Firstname) LIKE LOWER(?)
+                   OR LOWER(Lastname) LIKE LOWER(?)) 
+            AND (LOWER(UserId) = LOWER(?) OR LOWER(UserId) LIKE LOWER(?))
+        """, (f"%{clean_name}%", f"%{clean_name}%", f"%{clean_name}%", f"%{clean_name}%", doctor_id, f"{doctor_id}-%"))
+        
+        result = cursor.fetchone()
+        print(f"[DEBUG] Query result: {result}")
+        conn.close()
+        
+        if result:
+            user_id, firstname, lastname, specialty_id, display_name, is_active = result
+            full_name = display_name if display_name else f"{firstname} {lastname}"
+            
+            # Warn if doctor is not active but still authenticate for testing
+            status_msg = ""
+            if not is_active:
+                status_msg = " (Note: Doctor account is inactive)"
+                
+            return {
+                "authenticated": True,
+                "user_id": user_id,
+                "name": full_name,
+                "firstname": firstname,
+                "lastname": lastname,
+                "specialty_id": specialty_id,
+                "is_active": bool(is_active),
+                "status_message": status_msg
+            }
+        else:
+            return {"authenticated": False, "error": "Invalid doctor credentials - name or ID not found"}
+            
+    except Exception as e:
+        print(f"Authentication error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"authenticated": False, "error": "Authentication system error"}
 
 def detect_selected_slot(state: dict) -> dict:
     """
@@ -180,12 +241,31 @@ def fill_missing_booking_fields(state: dict) -> None:
 
 def welcome_node(state: dict) -> dict:
     """Initial welcome message for new conversations."""
-    if not state.get("chat_history"):
+    # Show welcome message based on user role, not chat history
+    if state.get("user_role"):
+        if state["user_role"] == "doctor":
+            doctor_name = state.get("doctor_authenticated_name", "Doctor")
+            return {
+                **state,
+                "final_answer": f"👋 Welcome back, Dr. {doctor_name}! I can help you check your appointments, patient schedules, and daily summaries. How can I assist you today?",
+                "next": "answer"
+            }
+        else:
+            return {
+                **state,
+                "final_answer": "👋 Welcome back! I'm here to help you book appointments.\n\n🔹 Do you know which doctor you'd like to see? (Just tell me their name)\n🔹 Or would you like me to suggest doctors based on a service you need?\n\nHow can I assist you today?",
+                "next": "answer"
+            }
+    else:
+        # No role established - ask for identification
         return {
             **state,
-            "final_answer": "👋 Hi! How can I help you today?",
+            "final_answer": "👋 Welcome! Please identify yourself:\n\n🔹 Type 'patient' if you'd like to book an appointment\n🔹 Type 'doctor' followed by your name and ID if you're a doctor (e.g., 'doctor Dr. Smith ID 123ABC' or 'doctor Antonella ID 11712738')\n\nHow can I help you today?",
+            "awaiting_role_identification": True,
             "next": "answer"
         }
+    
+    return state
     return state
 
 def ask_for_missing_fields_node(state: dict) -> dict:
@@ -219,13 +299,342 @@ def planner_node(state: dict) -> dict:
     """Main planning node that processes user input and determines next actions."""
     fill_missing_booking_fields(state)
     
-    user_input = state.get("user_input")
-    if not user_input:
-        raise ValueError("Missing 'user_input' in agent state")
+    user_input = state.get("user_input", "")
+    
+    # Handle initialization case (empty user input)
+    if not user_input.strip():
+        print("[DEBUG] Empty user input - routing to welcome")
+        return {**state, "next": "welcome"}
+    
     user_input_lower = user_input.lower()
 
     # ----------------------------------------
-    # Step 1: Extract structured fields
+    # Step 0: Check if user already has a role
+    # ----------------------------------------
+    user_role = state.get("user_role")
+    
+    # If user already has a role, skip role identification
+    if user_role and not state.get("awaiting_role_identification"):
+        print(f"[DEBUG] User already has role: {user_role}")
+        # Continue to normal processing
+        pass
+    # ----------------------------------------
+    # Step 0.1: Handle role identification for new users ONLY
+    # ----------------------------------------
+    elif not user_role:  # Only handle role identification if no role is set
+        if "patient" in user_input_lower:
+            state["user_role"] = "patient"
+            state.pop("awaiting_role_identification", None)
+            state["awaiting_doctor_or_service"] = True
+            state["final_answer"] = "Great! I'm here to help you book appointments.\n\n🔹 Do you know which doctor you'd like to see? (Just tell me their name)\n🔹 Or would you like me to suggest doctors based on a service you need? (e.g., 'I need a checkup' or 'I need dental care')\n\nWhat can I help you with?"
+            return {**state, "next": "answer"}
+        
+        elif "doctor" in user_input_lower:
+            # Extract doctor name and ID from input
+            # Expected format: "doctor Dr. Smith ID123" or "doctor John Smith ID456"
+            import re
+            
+            # Try to extract doctor name and ID
+            id_match = re.search(r'ID\s+([A-Fa-f0-9\-]+)', user_input, re.IGNORECASE)
+            if not id_match:
+                state["final_answer"] = "Please provide your doctor ID in the format: 'doctor Dr. YourName ID yourID' (e.g., 'doctor Antonella ID 11712738')"
+                return {**state, "next": "answer"}
+            
+            doctor_id = id_match.group(1)
+            
+            # Extract doctor name (everything between "doctor" and "ID")
+            name_match = re.search(r'doctor\s+(.+?)\s+ID', user_input, re.IGNORECASE)
+            if not name_match:
+                state["final_answer"] = "Please provide your name in the format: 'doctor Dr. YourName ID yourID' (e.g., 'doctor Antonella ID 11712738')"
+                return {**state, "next": "answer"}
+            
+            doctor_name = name_match.group(1).strip()
+            
+            # Authenticate doctor
+            auth_result = authenticate_doctor(doctor_name, doctor_id)
+            
+            if auth_result["authenticated"]:
+                state["user_role"] = "doctor"
+                state["doctor_authenticated_name"] = auth_result["name"]
+                state["doctor_user_id"] = auth_result["user_id"]
+                state["doctor_specialty_id"] = auth_result["specialty_id"]
+                state.pop("awaiting_role_identification", None)
+                
+                state["final_answer"] = (
+                    f"✅ Authentication successful! Welcome Dr. {auth_result['name']}.\n\n"
+                    f"I can help you with:\n"
+                    f"🔹 Check your upcoming appointments\n"
+                    f"🔹 View today's schedule\n"
+                    f"🔹 Get next patient information\n"
+                    f"🔹 Summarize your daily calendar\n\n"
+                    f"What would you like to do?"
+                )
+                return {**state, "next": "answer"}
+            else:
+                state["final_answer"] = f"❌ Authentication failed: {auth_result.get('error', 'Invalid credentials')}. Please try again with the correct format: 'doctor Dr. YourName ID yourID' (e.g., 'doctor Antonella ID 11712738')"
+                return {**state, "next": "answer"}
+        
+        else:
+            # If we're awaiting role identification but no role keywords found
+            if state.get("awaiting_role_identification"):
+                state["final_answer"] = "Please specify if you are a 'patient' or a 'doctor' (with your name and ID)."
+                return {**state, "next": "answer"}
+            else:
+                # No role set yet, prompt for identification
+                state["awaiting_role_identification"] = True
+                state["final_answer"] = "Please identify yourself:\n\n🔹 Type 'patient' if you'd like to book an appointment.\n🔹 Type 'doctor' followed by your name and ID if you're a doctor (e.g., 'doctor Dr. Smith ID 123ABC' or 'doctor Antonella ID 11712738').\n\nHow can I assist you today?"
+                return {**state, "next": "answer"}
+
+    # ----------------------------------------
+    # Step 0.2: Handle patient doctor/service selection
+    # ----------------------------------------
+    if state.get("awaiting_doctor_or_service") and state.get("user_role") == "patient":
+        # Check if user mentioned a doctor name
+        extracted_fields = extract_slots(user_input)
+        doctor_name = extracted_fields.get("doctor_name")
+        
+        if doctor_name:
+            # User specified a doctor name
+            state["doctor_name"] = doctor_name
+            state.pop("awaiting_doctor_or_service", None)
+            state["awaiting_service_selection"] = True
+            
+            # Autofill branch_id
+            if not state.get("branch_id"):
+                inferred_branch_id = get_branch_id_for_doctor(doctor_name)
+                if inferred_branch_id:
+                    state["branch_id"] = inferred_branch_id
+            
+            state["final_answer"] = f"Perfect! You'd like to see {doctor_name}.\n\nWhat service do you need? Here are the available services:\n\n🔹 **CONSULTATION** - General consultations and assessments\n🔹 **FACIAL** - Facial treatments and skin care\n🔹 **BOTOX** - Anti-aging and wrinkle treatments\n🔹 **BBL** - Laser skin treatments\n🔹 **SCULPTRA** - Facial sculpting treatments\n🔹 **EVOLVE X** - Body contouring\n🔹 **PRP** - Platelet-rich plasma therapy\n🔹 **DNA TEST** - Genetic testing services\n\nWhich service would you like to book?"
+            return {**state, "next": "answer"}
+        
+        # Check if user is asking for service-based suggestions
+        service_keywords = ["need", "want", "looking for", "service", "checkup", "consultation", "treatment", "care", "appointment for"]
+        if any(keyword in user_input_lower for keyword in service_keywords):
+            # User is asking for service-based suggestions
+            # Extract potential service name
+            service_name = extracted_fields.get("service_name")
+            
+            # Map common terms to actual services in database
+            service_mapping = {
+                "checkup": "CONSULTATION",
+                "general checkup": "CONSULTATION", 
+                "consultation": "CONSULTATION",
+                "facial": "FACIAL",
+                "botox": "BOTOX",
+                "beauty": "FACIAL",
+                "skin care": "FACIAL",
+                "anti-aging": "BOTOX",
+                "wrinkles": "BOTOX",
+                "skin treatment": "BBL",
+                "laser": "BBL",
+                "sculpting": "SCULPTRA",
+                "body contouring": "EVOLVE X",
+                "prp": "PRP",
+                "platelet": "PRP",
+                "dna": "DNA TEST",
+                "genetic": "DNA TEST"
+            }
+            
+            # Try to map user input to actual service
+            mapped_service = None
+            if service_name:
+                # Direct match first
+                mapped_service = service_name.upper()
+                # Try mapping if not found
+                if not mapped_service or mapped_service not in ["FACIAL", "ULTHERAPY", "BBL", "BOTOX", "DNA TEST", "CONSULTATION", "SCULPTRA", "RADIESSE", "EVOLVE X", "PRP"]:
+                    for key, value in service_mapping.items():
+                        if key.lower() in service_name.lower():
+                            mapped_service = value
+                            break
+            else:
+                # Try to find service keywords in user input
+                for key, value in service_mapping.items():
+                    if key.lower() in user_input_lower:
+                        mapped_service = value
+                        break
+            
+            if mapped_service:
+                # Try to find doctors who provide this service
+                doctors_with_service = suggest_doctor_for_service(mapped_service)
+                if doctors_with_service:
+                    state.pop("awaiting_doctor_or_service", None)
+                    state["awaiting_doctor_selection"] = True
+                    state["suggested_service"] = mapped_service
+                    state["final_answer"] = f"For '{mapped_service.lower()}', I can suggest these doctors:\n\n" + "\n".join([f"🔹 {doc}" for doc in doctors_with_service[:5]]) + f"\n\nWhich doctor would you prefer?"
+                    return {**state, "next": "answer"}
+            
+            # If no service match found, show available services
+            state["final_answer"] = (
+                "I'd be happy to suggest doctors based on the service you need. Here are the services we offer:\n\n"
+                "🔹 **CONSULTATION** - General consultations and assessments\n"
+                "🔹 **FACIAL** - Facial treatments and skin care\n" 
+                "🔹 **BOTOX** - Anti-aging and wrinkle treatments\n"
+                "🔹 **BBL** - Laser skin treatments\n"
+                "🔹 **SCULPTRA** - Facial sculpting treatments\n"
+                "🔹 **EVOLVE X** - Body contouring\n"
+                "🔹 **PRP** - Platelet-rich plasma therapy\n"
+                "🔹 **DNA TEST** - Genetic testing services\n\n"
+                "Which service interests you? Or if you know a specific doctor's name, just tell me!"
+            )
+            return {**state, "next": "answer"}
+        
+        # User didn't specify doctor or clear service request
+        state["final_answer"] = "I can help you in two ways:\n\n🔹 If you know a doctor's name, just tell me (e.g., 'Dr. Smith')\n🔹 If you need help choosing, tell me what kind of appointment you need (e.g., 'I need a checkup')\n\nWhat would you prefer?"
+        return {**state, "next": "answer"}
+    
+    # ----------------------------------------
+    # Step 0.3: Handle doctor selection from suggested list  
+    # ----------------------------------------
+    if state.get("awaiting_doctor_selection") and state.get("user_role") == "patient":
+        extracted_fields = extract_slots(user_input)
+        doctor_name = extracted_fields.get("doctor_name")
+        
+        if doctor_name:
+            state["doctor_name"] = doctor_name
+            state["service_name"] = state.get("suggested_service")  # Use the suggested service
+            state.pop("awaiting_doctor_selection", None)
+            state.pop("suggested_service", None)
+            state["awaiting_appointment_time"] = True
+            
+            # Autofill branch_id
+            if not state.get("branch_id"):
+                inferred_branch_id = get_branch_id_for_doctor(doctor_name)
+                if inferred_branch_id:
+                    state["branch_id"] = inferred_branch_id
+            
+            state["final_answer"] = f"Excellent choice! You'd like to see {doctor_name}.\n\nWhen would you like to schedule your appointment? You can say:\n🔹 'Today' or 'Tomorrow'\n🔹 A specific day like 'Monday' or 'Next Tuesday'\n🔹 'This week' to see available slots"
+            return {**state, "next": "answer"}
+        else:
+            state["final_answer"] = "Please choose one of the suggested doctors by mentioning their name, or tell me if you'd like to see different options."
+            return {**state, "next": "answer"}
+    
+    # ----------------------------------------
+    # Step 0.3b: Handle service selection for the chosen doctor
+    # ----------------------------------------
+    if state.get("awaiting_service_selection") and state.get("user_role") == "patient":
+        # Extract service name from user input
+        extracted_fields = extract_slots(user_input)
+        service_name = extracted_fields.get("service_name")
+        
+        # Map common terms to actual services in database
+        service_mapping = {
+            "checkup": "CONSULTATION",
+            "general checkup": "CONSULTATION", 
+            "consultation": "CONSULTATION",
+            "facial": "FACIAL",
+            "botox": "BOTOX",
+            "beauty": "FACIAL",
+            "skin care": "FACIAL",
+            "anti-aging": "BOTOX",
+            "wrinkles": "BOTOX",
+            "skin treatment": "BBL",
+            "laser": "BBL",
+            "sculpting": "SCULPTRA",
+            "body contouring": "EVOLVE X",
+            "prp": "PRP",
+            "platelet": "PRP",
+            "dna": "DNA TEST",
+            "genetic": "DNA TEST"
+        }
+        
+        # Try to map user input to actual service
+        mapped_service = None
+        if service_name:
+            # Direct match first
+            mapped_service = service_name.upper()
+            # Try mapping if not found in valid services
+            if mapped_service not in ["FACIAL", "ULTHERAPY", "BBL", "BOTOX", "DNA TEST", "CONSULTATION", "SCULPTRA", "RADIESSE", "EVOLVE X", "PRP"]:
+                for key, value in service_mapping.items():
+                    if key.lower() in service_name.lower():
+                        mapped_service = value
+                        break
+        else:
+            # Try to find service keywords in user input
+            for key, value in service_mapping.items():
+                if key.lower() in user_input_lower:
+                    mapped_service = value
+                    break
+        
+        if mapped_service and mapped_service in ["FACIAL", "ULTHERAPY", "BBL", "BOTOX", "DNA TEST", "CONSULTATION", "SCULPTRA", "RADIESSE", "EVOLVE X", "PRP"]:
+            # Valid service selected
+            state["service_name"] = mapped_service
+            state.pop("awaiting_service_selection", None)
+            state["awaiting_appointment_time"] = True
+            
+            state["final_answer"] = f"Great! You'd like to book a {mapped_service.lower()} appointment with {state.get('doctor_name')}.\n\nWhen would you like to schedule your appointment? You can say:\n🔹 'Today' or 'Tomorrow'\n🔹 A specific day like 'Monday' or 'Next Tuesday'\n🔹 'This week' to see available slots"
+            return {**state, "next": "answer"}
+        else:
+            # Invalid or no service selected
+            state["final_answer"] = "Please select one of the available services:\n\n🔹 **CONSULTATION** - General consultations and assessments\n🔹 **FACIAL** - Facial treatments and skin care\n🔹 **BOTOX** - Anti-aging and wrinkle treatments\n🔹 **BBL** - Laser skin treatments\n🔹 **SCULPTRA** - Facial sculpting treatments\n🔹 **EVOLVE X** - Body contouring\n🔹 **PRP** - Platelet-rich plasma therapy\n🔹 **DNA TEST** - Genetic testing services\n\nWhich service would you like to book?"
+            return {**state, "next": "answer"}
+
+    # ----------------------------------------
+    # Step 0.4: Handle appointment time selection
+    # ----------------------------------------
+    if state.get("awaiting_appointment_time") and state.get("user_role") == "patient":
+        # Handle "today", "tomorrow", specific days, etc.
+        if "today" in user_input_lower:
+            today_weekday = datetime.now().weekday()
+            state["weekday"] = today_weekday
+            state.pop("awaiting_appointment_time", None)
+            state["intermediate_steps"] = [{
+                "tool_name": "suggest_appointment_slots",
+                "args": {
+                    "doctor_name": state.get("doctor_name"),
+                    "weekday": today_weekday,
+                    "service_name": state.get("service_name", "CONSULTATION")
+                }
+            }]
+            return {**state, "next": "tool"}
+        
+        elif "tomorrow" in user_input_lower:
+            tomorrow_weekday = (datetime.now().weekday() + 1) % 7
+            state["weekday"] = tomorrow_weekday
+            state.pop("awaiting_appointment_time", None)
+            state["intermediate_steps"] = [{
+                "tool_name": "suggest_appointment_slots",
+                "args": {
+                    "doctor_name": state.get("doctor_name"),
+                    "weekday": tomorrow_weekday,
+                    "service_name": state.get("service_name", "CONSULTATION")
+                }
+            }]
+            return {**state, "next": "tool"}
+        
+        elif "this week" in user_input_lower:
+            state.pop("awaiting_appointment_time", None)
+            state["intermediate_steps"] = [{
+                "tool_name": "suggest_appointment_slots", 
+                "args": {
+                    "doctor_name": state.get("doctor_name"),
+                    "service_name": state.get("service_name", "CONSULTATION")
+                }
+            }]
+            return {**state, "next": "tool"}
+        
+        else:
+            # Try to extract specific weekday
+            extracted_fields = extract_slots(user_input)
+            weekday = extracted_fields.get("weekday")
+            
+            if weekday is not None:
+                state["weekday"] = weekday
+                state.pop("awaiting_appointment_time", None)
+                state["intermediate_steps"] = [{
+                    "tool_name": "suggest_appointment_slots",
+                    "args": {
+                        "doctor_name": state.get("doctor_name"),
+                        "weekday": weekday
+                    }
+                }]
+                return {**state, "next": "tool"}
+            else:
+                state["final_answer"] = "When would you like your appointment? You can say:\n🔹 'Today' or 'Tomorrow'\n🔹 A specific day like 'Monday', 'Tuesday', etc.\n🔹 'This week' to see all available slots"
+                return {**state, "next": "answer"}
+
+    # ----------------------------------------
+    # Step 1: Extract structured fields (for existing flow)
     # ----------------------------------------
     extracted_fields = {}
     should_extract = not state.get("awaiting_confirmation") and not state.get("available_slot_lines")
@@ -315,8 +724,70 @@ def planner_node(state: dict) -> dict:
                 state["tool_results"] = []
                 return {**state, "next": "answer"}
 
-    # Handle user asking if doctor is available "today"
-    if any(kw in user_input.lower() for kw in ["available today", "today", "free today", "open today"]):
+    # ----------------------------------------
+    # Doctor-specific queries
+    # ----------------------------------------
+    if state.get("user_role") == "doctor":
+        doctor_name = state.get("doctor_authenticated_name", "")
+        
+        # Handle doctor asking for their own appointments with improved time awareness
+        if any(kw in user_input_lower for kw in ["my appointments", "my schedule", "my patients", "appointments", "upcoming appointments", "check appointments"]):
+            # Determine time filter based on user input
+            after_date = None
+            limit = 10  # Default limit
+            
+            if any(kw in user_input_lower for kw in ["today", "today's"]):
+                after_date = datetime.now().strftime('%Y-%m-%d')
+                limit = 20  # More for daily view
+            elif any(kw in user_input_lower for kw in ["this week", "week", "upcoming"]):
+                after_date = datetime.now().isoformat()
+                limit = 15  # Week view
+            elif any(kw in user_input_lower for kw in ["next week"]):
+                next_week = datetime.now() + timedelta(weeks=1)
+                after_date = next_week.isoformat()
+                limit = 15
+            else:
+                # Default: upcoming appointments from now, limited to next week
+                after_date = datetime.now().isoformat()
+                limit = 10
+            
+            # Prepare the tool arguments
+            tool_args = {
+                "doctor_name": f"Dr. {doctor_name.split()[-1]}" if doctor_name else "",
+                "limit": limit
+            }
+            
+            if after_date:
+                tool_args["after"] = after_date
+            
+            state["intermediate_steps"] = [{
+                "tool_name": "get_appointments",
+                "args": tool_args
+            }]
+            return {**state, "next": "tool"}
+        
+        # Handle doctor asking for next patient
+        if any(kw in user_input_lower for kw in ["next patient", "next client", "who's next"]):
+            state["intermediate_steps"] = [{
+                "tool_name": "get_next_client_info",
+                "args": {
+                    "doctor_name": f"Dr. {doctor_name.split()[-1]}" if doctor_name else ""
+                }
+            }]
+            return {**state, "next": "tool"}
+        
+        # Handle doctor asking for daily summary
+        if any(kw in user_input_lower for kw in ["summarize today", "daily summary", "today's summary", "calendar summary"]):
+            state["intermediate_steps"] = [{
+                "tool_name": "summarize_calendar_today",
+                "args": {
+                    "doctor_name": f"Dr. {doctor_name.split()[-1]}" if doctor_name else ""
+                }
+            }]
+            return {**state, "next": "tool"}
+
+    # Handle user asking if doctor is available "today" (patient flow)
+    if state.get("user_role") == "patient" and any(kw in user_input.lower() for kw in ["available today", "today", "free today", "open today"]):
         doctor = state.get("doctor_name")
         if doctor:
             # Get today's weekday (0=Monday, 6=Sunday)
@@ -335,8 +806,11 @@ def planner_node(state: dict) -> dict:
             }]
             return {**state, "next": "tool"}
     
-    # Validate service name
-    if state.get("doctor_name") and state.get("service_name"):
+    # Validate service name (only when service is first provided, not during slot selection)
+    if (state.get("doctor_name") and state.get("service_name") and 
+        not state.get("awaiting_slot_selection") and 
+        not state.get("awaiting_confirmation") and 
+        not state.get("proposed_booking")):
         doctor = state["doctor_name"]
         service = state["service_name"]
         if not is_service_valid_for_doctor(doctor, service):
@@ -610,9 +1084,7 @@ def respond_naturally_node(state: dict) -> dict:
     if tool_name == "suggest_appointment_slots":
         tool_results = state.get("tool_results", [])
         slots_text = tool_results[0] if tool_results else ""
-        lines = slots_text.splitlines()
-        available_slots = []
-
+        
         weekday_name = None
         is_today_request = False
         
@@ -622,60 +1094,93 @@ def respond_naturally_node(state: dict) -> dict:
             current_weekday = datetime.now().weekday()
             is_today_request = weekday == current_weekday
 
-        for line in lines:
-            try:
-                cleaned = clean_date_line(line)
-                date_part = cleaned.split(":")[0].strip()
-                date_with_year = f"{date_part} {datetime.now().year}"
-                parsed_date = datetime.strptime(date_with_year, "%A, %b %d %Y")
-
-                if weekday is None or parsed_date.weekday() == weekday:
-                    slot_info = parse_slot_line(line)
-                    if slot_info:
+        # Simply display the slots text as-is since it's already formatted
+        if slots_text and "🎯 Available appointment slots:" in slots_text:
+            # Extract the appointment slot lines for selection
+            lines = slots_text.splitlines()
+            available_slots = []
+            
+            for line in lines:
+                if line.strip() and "📅" in line:
+                    # Extract individual slots from the line
+                    # Format: 📅 Tuesday, Jul 08: 10:00-10:15, 10:15-10:30, 10:30-10:45 (15 min slots)
+                    try:
+                        # Remove emoji and extract date part
+                        cleaned_line = line.replace("📅", "").strip()
+                        if ":" in cleaned_line:
+                            date_part, time_part = cleaned_line.split(":", 1)
+                            date_part = date_part.strip()
+                            
+                            # Extract individual time slots before the parenthetical
+                            if "(" in time_part:
+                                time_part = time_part.split("(")[0].strip()
+                            
+                            # Split time slots by comma
+                            time_slots = [slot.strip() for slot in time_part.split(",")]
+                            
+                            for time_slot in time_slots:
+                                if "-" in time_slot and ":" in time_slot:
+                                    # Parse individual slot like "10:00-10:15"
+                                    start_time, end_time = time_slot.split("-")
+                                    start_time = start_time.strip()
+                                    end_time = end_time.strip()
+                                    
+                                    # Create a formatted line for this individual slot
+                                    individual_slot_line = f"{date_part}: {start_time} - {end_time}"
+                                    
+                                    # Try to parse this individual slot
+                                    slot_info = parse_slot_line(individual_slot_line)
+                                    if slot_info:
+                                        available_slots.append({
+                                            "start_time": slot_info["start_time"],
+                                            "end_time": slot_info["end_time"],
+                                            "display": individual_slot_line
+                                        })
+                                    else:
+                                        # Fallback - create a display entry without parsing
+                                        available_slots.append({
+                                            "start_time": None,
+                                            "end_time": None,
+                                            "display": individual_slot_line
+                                        })
+                    except Exception as e:
+                        print(f"Error parsing slot line: {line}, error: {e}")
+                        # If all parsing fails, just include the original line
                         available_slots.append({
-                            "start_time": slot_info["start_time"],
-                            "end_time": slot_info["end_time"],
-                            "display": line
+                            "start_time": None,
+                            "end_time": None,
+                            "display": line.strip()
                         })
-            except Exception:
-                available_slots.append({
-                    "start_time": None,
-                    "end_time": None,
-                    "display": line
-                })
-
-        if available_slots:
+            
             if is_today_request:
                 message = (
                     f"Yes, Dr. {doctor} is available today ({weekday_name}). "
-                    f"Here are the available time slots:\n\n"
-                    + "\n".join([slot["display"] for slot in available_slots])
-                    + "\n\nWhich slot would you like to book?"
+                    f"Here are the available time slots:\n\n{slots_text}\n\n"
+                    f"Which slot would you like to book?"
                 )
             else:
                 message = (
                     f"Yes, Dr. {doctor} is available"
                     + (f" on {weekday_name}" if weekday_name else "")
-                    + ". Here are the time slots:\n\n"
-                    + "\n".join([slot["display"] for slot in available_slots])
-                    + "\n\nWhich slot would you like to book?"
+                    + f". Here are the time slots:\n\n{slots_text}\n\n"
+                    + f"Which slot would you like to book?"
                 )
+            
             state["available_slot_lines"] = available_slots
         else:
+            # No slots available or error message
             if is_today_request:
                 message = (
                     f"Dr. {doctor} is not available today ({weekday_name}). "
-                    "But here are some upcoming available slots:\n\n"
-                    + slots_text
+                    f"Here's what I found:\n\n{slots_text}"
                 )
             elif weekday_name:
                 message = (
                     f"Dr. {doctor} is not available on {weekday_name}. "
-                    "But here are some nearby available slots:\n\n"
-                    + slots_text
+                    f"Here's what I found:\n\n{slots_text}"
                 )
             else:
-                message = f"Let me check available time slots for Dr. {doctor}.\n\n" + slots_text
+                message = f"Here are the available slots for Dr. {doctor}:\n\n{slots_text}"
 
         state["tool_results"] = []  # Clear to prevent re-display in final serializer
 
@@ -734,10 +1239,24 @@ def call_tool_node(state: dict) -> dict:
         if tool_name == "suggest_appointment_slots" and "weekday" in state:
             arguments["weekday"] = state["weekday"]
 
-        # Restrict access to certain tools
-        if tool_name in SENSITIVE_TOOLS and role != "doctor":
-            results.append(f"Access denied to `{tool_name}`. Doctor access required.")
-            continue
+        # Enhanced access control for sensitive tools
+        if tool_name in SENSITIVE_TOOLS:
+            if role != "doctor":
+                results.append(f"❌ Access denied to `{tool_name}`. Doctor authentication required.")
+                continue
+            else:
+                # Verify doctor is accessing their own data
+                requested_doctor = arguments.get("doctor_name", "")
+                authenticated_doctor = state.get("doctor_authenticated_name", "")
+                
+                if requested_doctor and authenticated_doctor:
+                    # Extract last name for comparison
+                    requested_lastname = requested_doctor.replace("Dr.", "").strip().split()[-1].lower()
+                    auth_lastname = authenticated_doctor.split()[-1].lower()
+                    
+                    if requested_lastname != auth_lastname:
+                        results.append(f"❌ Access denied. You can only access your own appointment information.")
+                        continue
 
         try:
             result = call_mcp_tool(tool_name, arguments)
@@ -747,7 +1266,7 @@ def call_tool_node(state: dict) -> dict:
             if tool_name == "book_appointment_tool":
                 print("📥 Incoming booking payload:", arguments)
                 booking_confirmation = result
-            elif tool_name == "get_appointments":
+            elif tool_name in ["get_appointments", "get_next_client_info", "summarize_calendar_today"]:
                 appointments_output = result
 
         except Exception as e:
