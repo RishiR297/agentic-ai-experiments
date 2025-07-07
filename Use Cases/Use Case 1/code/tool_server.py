@@ -67,12 +67,15 @@ MCP_TOOL_REGISTRY = [
         "type": "function",
         "function": {
             "name": "get_appointments",
-            "description": "Get all appointments for a doctor, optionally filtered by status.",
+            "description": "Get appointments for a doctor, optionally filtered by status, time range, and limited by count. Defaults to upcoming appointments within the next week if no time filters specified.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "doctor_name": {"type": "string"},
-                    "status": {"type": "string"}
+                    "status": {"type": "string"},
+                    "after": {"type": "string", "format": "date-time"},
+                    "before": {"type": "string", "format": "date-time"},
+                    "limit": {"type": "integer", "default": 10}
                 },
                 "required": ["doctor_name"]
             },
@@ -160,6 +163,7 @@ class ToolRequest(BaseModel):
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     after: Optional[str] = None
+    before: Optional[str] = None
     limit: Optional[int] = 5
     weekday: Optional[int] = None
     status: Optional[str] = None
@@ -195,7 +199,20 @@ def call_get_appointments(req: ToolRequest):
     # doctor_name is required
     if not req.doctor_name:
         raise HTTPException(status_code=400, detail="Missing required field: doctor_name")
-    args = req.model_dump(exclude_none=True)
+    
+    # Only pass the fields that get_appointments expects
+    args = {}
+    if req.doctor_name:
+        args["doctor_name"] = req.doctor_name
+    if req.status:
+        args["status"] = req.status
+    if req.after:
+        args["after"] = req.after
+    if req.before:
+        args["before"] = req.before
+    if req.limit:
+        args["limit"] = req.limit
+    
     return get_appointments(**args)
 
 
