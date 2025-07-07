@@ -80,9 +80,11 @@ class AgentStateRequest(BaseModel):
 # Backend receive handler
 @app.post("/invoke")
 async def invoke(state: dict):
+    # Handle initialization case (no user input - just show welcome)
     if "user_input" not in state:
-        print("Received state missing user_input")
-        return {"error": "Missing 'user_input' in agent state"}
+        print("Received state missing user_input - treating as initialization")
+        # For initialization, we call the agent with an empty user_input to trigger welcome
+        state["user_input"] = ""
     
     result = doctor_agent_executor.invoke(state)
     return result
@@ -105,4 +107,4 @@ if __name__ == "__main__":
     if missing:
         print(f"Missing Azure OpenAI env vars: {missing}")
     else:
-        uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+        uvicorn.run("main:app", host="0.0.0.0", port=8003, reload=False)
