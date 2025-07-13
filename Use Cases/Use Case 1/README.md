@@ -1,52 +1,178 @@
-# Doctor Appointment Booking Agent
+# LangGraph Medical Assistant
 
-A conversational AI agent for booking doctor appointments using LangGraph, built with a robust appointment booking flow that handles natural language inputs and integrates with a SQLite database.
+A sophisticated multi-turn conversational agent for medical appointment management, built with LangGraph and FastAPI.
 
-## Quick Start
+## 🏗️ Architecture Overview
 
-**Environment Variables Required**: Set up necessary environment variables for the agent to run.
-
-**Run the Application**:
-```bash
-cd '.\Use Cases\Use Case 1\code\'
-npm run dev
-```
-
-## Features
-
-- **Natural Language Processing**: Understands user requests in natural language
-- **Doctor Name Normalization**: Handles various formats of doctor names ("Dr.", "doctor", etc.)
-- **Intelligent Slot Selection**: Uses LLM to interpret user time preferences
-- **Availability Checking**: Validates doctor schedules and existing appointments
-- **Robust State Management**: Handles missing information collection
-- **Database Integration**: Works with existing hospital appointment systems
-
-## Architecture
+This application has been reorganized from a simple LLM-powered tool into a comprehensive LangGraph multi-turn agent with the following architecture:
 
 ```
 code/
-├── agent/                  # LangGraph agent implementation
-│   ├── graph.py           # Agent workflow graph definition
-│   ├── nodes.py           # Core agent logic nodes
-│   ├── state.py           # Agent state management
-│   └── tools/             # Agent-specific tools
-│       ├── appointment.py # Appointment booking logic
-│       └── mcp_client.py  # MCP client integration
-├── tools/                 # Shared utility tools
-│   ├── doctor.py          # Doctor lookup and validation
-│   └── branch.py          # Branch management utilities
-├── utils/                 # Core utilities
-│   ├── db.py              # Database connection management
-│   ├── llm_extraction.py  # LLM-based field extraction
-│   └── time_parser.py     # Time and date parsing utilities
-├── main.py                # Main application entry point
-├── streamlit_app.py       # Streamlit web interface
-└── tool_server.py         # FastAPI tool server (MCP-style)
+├── agent/                    # LangGraph Agent Implementation
+│   ├── state.py             # Agent state management & conversation history
+│   ├── nodes.py             # Processing nodes (intent, query, response)
+│   ├── graph.py             # LangGraph workflow definition
+│   └── tools/               # Agent tools
+│       ├── appointment_tools.py  # Appointment management
+│       └── query_tools.py        # SQL query generation
+├── core/                    # Core Services
+│   ├── config.py           # Configuration management
+│   ├── database.py         # Database operations
+│   └── llm_service.py      # LLM interactions
+├── api/                     # REST API Layer
+│   ├── app.py              # FastAPI application
+│   └── routes.py           # API endpoints
+├── ui/                      # User Interface (Future)
+├── main.py                 # Application entry point
+├── streamlit_app.py        # Streamlit web interface
+└── requirements.txt        # Dependencies
 ```
 
-## Database Schema
+## 🤖 Agent Capabilities
 
-The system works with the following key tables:
+### Multi-Turn Conversations
+- **State Management**: Maintains conversation history and context across turns
+- **Intent Recognition**: Understands user intentions using LLM-based analysis
+- **Entity Extraction**: Extracts relevant information from user queries
+- **Clarification Handling**: Asks for clarification when intent is unclear
+
+### Appointment Management
+- **Natural Language Queries**: "Show me upcoming appointments", "Find patient Smith"
+- **Date/Time Filtering**: "appointments today", "this week", "tomorrow"
+- **Patient Search**: Search by patient ID or name
+- **Status Filtering**: Filter by appointment status (scheduled, cancelled, etc.)
+- **Doctor-Specific Views**: Filter appointments by doctor UUID
+
+### Query Processing
+- **LLM-Generated SQL**: Dynamic SQL query generation from natural language
+- **Fallback Mechanisms**: Hardcoded query patterns when LLM fails
+- **Query Validation**: Safety checks to prevent dangerous SQL operations
+- **Multiple Strategies**: Intent-based routing to appropriate query methods
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Python 3.8+
+- SQLite database with medical appointment data
+- Azure OpenAI API access
+
+### Installation
+
+1. **Install Dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Environment Configuration**
+   Create a `.env` file with:
+   ```env
+   AZURE_OPENAI_ENDPOINT=your_azure_endpoint
+   AZURE_OPENAI_API_KEY=your_api_key
+   AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=your_deployment_name
+   AZURE_OPENAI_API_VERSION=2024-02-15-preview
+   
+   # Optional configurations
+   API_HOST=127.0.0.1
+   API_PORT=8001
+   DEBUG=true
+   USE_LLM_QUERY_GENERATION=true
+   FALLBACK_TO_HARDCODED_ON_LLM_FAILURE=true
+   ENABLE_DEBUG_LOGGING=true
+   ```
+
+3. **Database Setup**
+   Ensure your SQLite database is available at `./db/output.db` with:
+   - `View_Appointments` view/table
+   - `COR_Doctor` table
+   - Proper schema as expected by the application
+
+### Running the Application
+
+#### Option 1: Run Both Servers Concurrently (Recommended)
+
+**Using Python:**
+```bash
+cd code
+python run_servers.py
+```
+
+**Using NPM:**
+```bash
+cd code
+npm install  # First time only
+npm start    # Runs both LangGraph (8001) and MCP (8002) servers
+```
+
+**Using PowerShell (Windows):**
+```powershell
+cd code
+.\start_servers.ps1
+```
+
+#### Option 2: Individual Servers
+
+**LangGraph Server Only (Port 8001):**
+```bash
+cd code
+npm run start-langgraph
+# OR
+cd code/src && python api/langgraph_server.py
+```
+
+**MCP Server Only (Port 8002):**
+```bash
+cd code
+npm run start-mcp
+# OR
+cd code/src && python api/mcp_server.py
+```
+
+#### Option 3: Legacy Interface (Archived)
+```bash
+cd code
+npm run start-legacy
+# OR
+cd code/legacy && python streamlit_app.py
+```
+
+### Server URLs
+- **LangGraph API:** `http://localhost:8001` (Main medical agent)
+- **MCP API:** `http://localhost:8002` (Enhanced context version)
+- **API Documentation:** `http://localhost:8001/docs` or `http://localhost:8002/docs`
+
+### NPM Commands Reference
+
+```bash
+npm start        # Run both servers concurrently (LangGraph + MCP)
+npm run dev      # Same as npm start
+npm run start-both        # Alternative: use Python script
+npm run start-langgraph   # Run only LangGraph server (Port 8001)
+npm run start-mcp         # Run only MCP server (Port 8002)
+npm run start-legacy      # Run legacy Streamlit app
+npm test         # Run tests (placeholder)
+```
+
+### Testing the APIs
+
+**Test LangGraph Server:**
+```bash
+curl -X POST http://localhost:8001/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "I need to book an appointment with a cardiologist"}'
+```
+
+**Test MCP Server:**
+```bash
+curl -X POST http://localhost:8002/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "I need to book an appointment with a cardiologist"}'
+```
+
+### Environment Check
+```bash
+python main.py --check-env
+```
+Validates configuration and component health.
 
 - **View_Appointments**: Main appointments table with all booking data
 - **View_Appointments_Setup**: Reference table for doctor-service combinations
