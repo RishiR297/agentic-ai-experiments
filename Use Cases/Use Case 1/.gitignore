@@ -1,0 +1,54 @@
+# Python Cache and Compiled Files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# Environment Variables & Config Files
+.env
+.env.*
+.env.local
+.env.development
+.env.test
+.env.production
+.env.staging
+*.env
+
+# Node.js
+node_modules/
+package-lock.json
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+
+# Logs
+*.log
+logs/
+
+# IDE Files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+
+# Analysis Files (project-specific)
+*analysis*.py
+*demo*.py
+SETUP_COMPLETE.md
