@@ -1,13 +1,21 @@
 {
-  "name": "code",
+  "name": "medical-appointment-agent",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Medical Appointment Agent with LangGraph and MCP support",
+  "main": "run_servers.py",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start-dev": "concurrently --raw -n TOOLS,BACKEND,UI -c yellow,cyan,green \"uvicorn tool_server:app --host 127.0.0.1 --port 8001 --reload\" \"python main.py\" \"streamlit run streamlit_app.py\""
+    "start": "concurrently --raw -n LANGGRAPH,MCP -c cyan,yellow \"cd src && python api/langgraph_server.py\" \"cd src && python api/mcp_server.py\"",
+    "dev": "npm run start",
+    "start-both": "python run_servers.py",
+    "start-langgraph": "cd src && python api/langgraph_server.py",
+    "start-mcp": "cd src && python api/mcp_server.py",
+    "start-legacy": "cd legacy && python streamlit_app.py",
+    "test": "echo \"No tests specified yet\" && exit 0"
   },
-  "keywords": [],
+  "keywords": ["medical", "appointment", "agent", "langgraph", "mcp", "ai"],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "concurrently": "^9.2.0"
+  }
 }
