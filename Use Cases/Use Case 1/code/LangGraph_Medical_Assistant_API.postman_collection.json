@@ -1,0 +1,262 @@
+{
+  "info": {
+    "name": "LangGraph Medical Assistant API",
+    "description": "Complete API collection for testing the LangGraph-based medical assistant",
+    "version": "4.0",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8502",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "doctor_1_{{$timestamp}}",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": ["{{base_url}}"],
+          "path": ["health"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "API Information",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/",
+          "host": ["{{base_url}}"],
+          "path": [""]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Available Tools (Doctor)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-User-Role",
+            "value": "doctor",
+            "type": "text"
+          },
+          {
+            "key": "X-Doctor-ID",
+            "value": "1",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/tools",
+          "host": ["{{base_url}}"],
+          "path": ["tools"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Available Tools (Assistant)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-User-Role",
+            "value": "assistant",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/tools",
+          "host": ["{{base_url}}"],
+          "path": ["tools"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Chat - Who's my next patient?",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-User-Role",
+            "value": "doctor",
+            "type": "text"
+          },
+          {
+            "key": "X-Doctor-ID",
+            "value": "1",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"Who's my next patient?\",\n  \"session_id\": \"{{session_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/chat",
+          "host": ["{{base_url}}"],
+          "path": ["chat"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Chat - Who's at 2 PM? (Time-Specific)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-User-Role",
+            "value": "doctor",
+            "type": "text"
+          },
+          {
+            "key": "X-Doctor-ID",
+            "value": "1",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"Who's at 2 PM?\",\n  \"session_id\": \"{{session_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/chat",
+          "host": ["{{base_url}}"],
+          "path": ["chat"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Chat - Today's appointments",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-User-Role",
+            "value": "doctor",
+            "type": "text"
+          },
+          {
+            "key": "X-Doctor-ID",
+            "value": "1",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"What are my appointments today?\",\n  \"session_id\": \"{{session_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/chat",
+          "host": ["{{base_url}}"],
+          "path": ["chat"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Chat - Tomorrow's schedule",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-User-Role",
+            "value": "doctor",
+            "type": "text"
+          },
+          {
+            "key": "X-Doctor-ID",
+            "value": "1",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"What's my schedule tomorrow?\",\n  \"session_id\": \"{{session_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/chat",
+          "host": ["{{base_url}}"],
+          "path": ["chat"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Session Context",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/context/{{session_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["context", "{{session_id}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "MCP Summary",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/mcp/summary",
+          "host": ["{{base_url}}"],
+          "path": ["mcp", "summary"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Demo Test Endpoint",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/demo/test",
+          "host": ["{{base_url}}"],
+          "path": ["demo", "test"]
+        }
+      },
+      "response": []
+    }
+  ]
+}
