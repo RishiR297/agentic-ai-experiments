@@ -181,7 +181,19 @@ async def chat_endpoint(
             print(f"🗄️  SQL QUERY: {sql_metadata.get('raw_query', 'N/A')}")
             print(f"📊 PARAMETERS: {sql_metadata.get('parameters', [])}")
         
-        return ChatResponse(
+        # Debug logging for response data
+        print("=" * 60)
+        print("🔍 API RESPONSE DEBUG")
+        print("=" * 60)
+        print(f"📊 Result keys: {list(result.keys())}")
+        print(f"🆔 Session ID: {session_id}")
+        print(f"🗄️  SQL Metadata present: {bool(sql_metadata)}")
+        print(f"👤 Identity Context present: {bool(identity_context)}")
+        print(f"💬 Conversation Context present: {bool(result.get('conversation_context', {}))}")
+        print(f"📝 Metadata present: {bool(result.get('metadata', {}))}")
+        print("=" * 60)
+        
+        response = ChatResponse(
             success=True,
             result=result.get("result", "No response generated"),
             session_id=session_id,
@@ -191,6 +203,12 @@ async def chat_endpoint(
             sql_metadata=sql_metadata,
             identity_context=identity_context
         )
+        
+        # Debug the actual response being sent
+        print(f"🚀 Response SQL metadata: {response.sql_metadata}")
+        print(f"🚀 Response session_id: {response.session_id}")
+        
+        return response
         
     except Exception as e:
         logger.error(f"Chat endpoint error: {e}")
