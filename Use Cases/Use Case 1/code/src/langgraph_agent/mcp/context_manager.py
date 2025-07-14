@@ -12,7 +12,7 @@ conversation context across turns using the Model Context Protocol.
 import json
 import asyncio
 from typing import Dict, Any, List, Optional, Union
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from ..memory.conversation_memory import ConversationMemory
 
@@ -52,9 +52,10 @@ class MCPContextManager:
     - Cross-session context sharing when appropriate
     """
     
-    def __init__(self, conversation_memory):
+    def __init__(self, conversation_memory, max_context_items: int = 5):
         self.conversation_memory = conversation_memory
         self.active_contexts: Dict[str, List[MCPContextItem]] = {}
+        self.max_context_items = max_context_items  # Enforce 5-item limit
         
     async def create_context_item(
         self,
@@ -63,7 +64,7 @@ class MCPContextManager:
         content: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None
     ) -> MCPContextItem:
-        """Create a new MCP context item."""
+        """Create a new MCP context item with automatic pruning."""
         
         context_id = f"{session_id}_{context_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
@@ -78,7 +79,11 @@ class MCPContextManager:
         # Store in active contexts
         if session_id not in self.active_contexts:
             self.active_contexts[session_id] = []
+        
         self.active_contexts[session_id].append(context_item)
+        
+        # Enforce 5-item limit with temporal decay and relevance scoring
+        await self._enforce_context_limit(session_id)
         
         # Persist to conversation memory
         self.conversation_memory.add_mcp_context_mapping(
@@ -89,7 +94,38 @@ class MCPContextManager:
             relevance_score=context_item.relevance_score
         )
         
+        print(f"🧠 MCP: Created context item {context_id} (type: {context_type})")
+        print(f"📊 MCP: Session {session_id} now has {len(self.active_contexts[session_id])} context items")
+        
         return context_item
+    
+    async def _enforce_context_limit(self, session_id: str):
+        """Enforce the 5-item context limit with temporal decay."""
+        if session_id not in self.active_contexts:
+            return
+        
+        context_items = self.active_contexts[session_id]
+        
+        if len(context_items) > self.max_context_items:
+            # Sort by relevance score and recency (temporal decay)
+            now = datetime.now()
+            
+            def context_score(item: MCPContextItem) -> float:
+                # Temporal decay: reduce relevance based on age
+                age_hours = (now - item.created_at).total_seconds() / 3600
+                decay_factor = max(0.1, 1.0 - (age_hours * 0.1))  # 10% decay per hour
+                
+                return item.relevance_score * decay_factor
+            
+            # Sort by combined score (relevance + temporal decay)
+            sorted_items = sorted(context_items, key=context_score, reverse=True)
+            
+            # Keep only the top 5 most relevant/recent items
+            self.active_contexts[session_id] = sorted_items[:self.max_context_items]
+            
+            removed_count = len(context_items) - self.max_context_items
+            print(f"🗑️  MCP: Pruned {removed_count} old context items from session {session_id}")
+            print(f"📊 MCP: Retained {len(self.active_contexts[session_id])} most relevant items")
     
     async def get_relevant_context(
         self,

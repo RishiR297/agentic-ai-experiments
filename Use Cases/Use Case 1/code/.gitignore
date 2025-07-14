@@ -8,15 +8,6 @@ __pycache__/
 venv/
 env/
 .venv/
-
-# Environment Variables & Config Files
-.env
-.env.*
-.env.local
-.env.development
-.env.test
-.env.production
-.env.staging
 .env
 
 # Node.js
@@ -42,6 +33,10 @@ logs/
 # OS Files
 .DS_Store
 Thumbs.db
+
+# Environment Variables
+.env
+.env.local
 
 # Temporary Files
 *.tmp

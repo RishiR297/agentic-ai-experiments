@@ -52,7 +52,7 @@ agent = MedicalAssistantAgent()
 
 # Request/Response models
 class ChatRequest(BaseModel):
-    user_input: str
+    message: str  # Changed from user_input for consistency
     session_id: Optional[str] = None
     doctor_id: Optional[str] = None
     user_role: Optional[str] = None
@@ -64,12 +64,34 @@ class ChatResponse(BaseModel):
     metadata: Dict[str, Any] = {}
     tool_name: str = "unknown"
     conversation_context: Dict[str, Any] = {}
+    sql_metadata: Optional[Dict[str, Any]] = None  # Added for observability
+    identity_context: Optional[Dict[str, Any]] = None  # Added for role tracking
 
 class HealthResponse(BaseModel):
     status: str
     timestamp: str
     agent_status: str
     active_sessions: int
+
+# Role validation
+VALID_ROLES = ["doctor", "assistant"]
+
+def validate_role(role: str) -> bool:
+    """Validate user role."""
+    return role in VALID_ROLES
+
+def extract_identity_context(
+    x_user_role: Optional[str] = None,
+    x_doctor_id: Optional[str] = None, 
+    x_user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Extract identity context from headers."""
+    return {
+        "role": x_user_role or "assistant",
+        "doctor_id": x_doctor_id,
+        "user_id": x_user_id,
+        "timestamp": datetime.now().isoformat()
+    }
 
 # Utility functions
 def extract_user_context(request: Request, headers: Dict[str, str]) -> Dict[str, Any]:
@@ -102,49 +124,72 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
     request: ChatRequest,
-    x_user_role: Optional[str] = Header(None),
-    x_doctor_id: Optional[str] = Header(None),
-    x_session_id: Optional[str] = Header(None)
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_doctor_id: Optional[str] = Header(None, alias="X-Doctor-ID"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID")
 ):
     """
-    Main chat endpoint for multi-turn conversations.
+    Main chat endpoint with role-based access control and observability.
     
-    Supports context preservation and implicit reference resolution.
+    Headers:
+    - X-User-Role: Role of the user (doctor, nurse, admin)
+    - X-Doctor-ID: Doctor identifier (required for doctor role)
+    - X-User-ID: User identifier
     """
     try:
-        # Extract user context
-        user_role = request.user_role or x_user_role or "assistant"
-        doctor_id = request.doctor_id or x_doctor_id
-        session_id = request.session_id or x_session_id
+        # Extract identity from headers (prioritize headers over request body)
+        user_role = x_user_role or request.user_role or "assistant"
+        doctor_id = x_doctor_id or request.doctor_id
         
-        # Generate session ID if not provided
-        if not session_id:
-            session_id = generate_session_id(user_role, doctor_id)
+        # Validate role
+        if not validate_role(user_role):
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Invalid role: {user_role}. Valid roles: {VALID_ROLES}"
+            )
         
-        # Validate role-based access
+        # Role-specific validation
         if user_role == "doctor" and not doctor_id:
             raise HTTPException(
                 status_code=400, 
                 detail="Doctor ID required for doctor role"
             )
         
-        logger.info(f"Chat request - Session: {session_id}, Role: {user_role}, Query: {request.user_input}")
+        # Extract identity context
+        identity_context = extract_identity_context(x_user_role, x_doctor_id, x_user_id)
         
-        # Process through agent
+        # Generate session ID if not provided
+        session_id = request.session_id
+        if not session_id:
+            session_id = generate_session_id(user_role, doctor_id)
+        
+        logger.info(f"🔐 Chat request from {user_role} (session: {session_id})")
+        logger.info(f"📝 Message: {request.message}")
+        
+        # Process with agent
         result = agent.process_message(
-            message=request.user_input,
+            message=request.message,
             session_id=session_id,
             user_role=user_role,
-            doctor_id=doctor_id
+            doctor_id=doctor_id,
+            identity_context=identity_context
         )
         
+        # Extract SQL metadata for observability
+        sql_metadata = result.get("sql_metadata", {})
+        if sql_metadata:
+            print(f"🗄️  SQL QUERY: {sql_metadata.get('raw_query', 'N/A')}")
+            print(f"📊 PARAMETERS: {sql_metadata.get('parameters', [])}")
+        
         return ChatResponse(
-            success=result["success"],
-            result=result["result"],
-            session_id=result["session_id"],
-            metadata=result["metadata"],
-            tool_name=result["tool_name"],
-            conversation_context=result.get("conversation_context", {})
+            success=True,
+            result=result.get("result", "No response generated"),
+            session_id=session_id,
+            metadata=result.get("metadata", {}),
+            tool_name=result.get("tool_name", "unknown"),
+            conversation_context=result.get("conversation_context", {}),
+            sql_metadata=sql_metadata,
+            identity_context=identity_context
         )
         
     except Exception as e:

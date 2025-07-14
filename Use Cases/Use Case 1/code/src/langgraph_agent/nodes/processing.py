@@ -8,6 +8,7 @@ with enhanced MCP (Model Context Protocol) integration for superior context pres
 
 import json
 import logging
+import re
 from typing import Dict, Any
 from datetime import datetime
 
@@ -21,6 +22,64 @@ from langgraph_agent.tools.database import (
 from langgraph_agent.tools.mcp_context_manager import mcp_context_manager
 
 logger = logging.getLogger(__name__)
+
+
+def clean_json_response(response_content: str) -> str:
+    """
+    Clean OpenAI response content to extract valid JSON.
+    Handles responses wrapped in ```json code blocks and removes comments.
+    """
+    # Remove code block markers
+    content = response_content.strip()
+    if content.startswith("```json"):
+        content = content[7:]  # Remove ```json
+    if content.startswith("```"):
+        content = content[3:]   # Remove ```
+    if content.endswith("```"):
+        content = content[:-3]  # Remove closing ```
+    
+    # Remove single-line comments (// comments)
+    lines = content.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # Remove // comments but preserve the rest of the line
+        if '//' in line:
+            comment_pos = line.find('//')
+            # Check if // is inside a string
+            before_comment = line[:comment_pos]
+            quote_count = before_comment.count('"') - before_comment.count('\\"')
+            if quote_count % 2 == 0:  # Even number of quotes means // is outside string
+                line = line[:comment_pos].rstrip()
+        cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines).strip()
+
+
+def safe_json_parse(response_content: str, node_name: str) -> Dict[str, Any]:
+    """
+    Safely parse JSON response with cleaning and error handling.
+    """
+    try:
+        cleaned_content = clean_json_response(response_content)
+        return json.loads(cleaned_content)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in {node_name}: {e}")
+        logger.error(f"Response content was: {response_content}")
+        
+        # Try to extract JSON pattern manually
+        json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+        matches = re.findall(json_pattern, cleaned_content, re.DOTALL)
+        if matches:
+            try:
+                return json.loads(matches[0])
+            except:
+                pass
+        
+        # Return a safe default
+        return {
+            "error": f"Failed to parse JSON in {node_name}",
+            "raw_content": response_content[:200] + "..." if len(response_content) > 200 else response_content
+        }
 
 
 def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
@@ -107,10 +166,9 @@ Respond in JSON format:
             raise ValueError("Empty response from OpenAI")
         
         try:
-            result = json.loads(response.content)
-        except json.JSONDecodeError as je:
-            logger.error(f"JSON decode error in context resolver: {je}")
-            logger.error(f"Response content was: '{response.content}'")
+            result = safe_json_parse(response.content, "context resolver")
+        except Exception as je:
+            logger.error(f"Context resolution error: {je}")
             # Use fallback logic if JSON parsing fails
             raise je
         
@@ -203,10 +261,9 @@ Select the best tool and parameters. Respond in JSON format:
             raise ValueError("Empty response from OpenAI")
         
         try:
-            result = json.loads(response.content)
-        except json.JSONDecodeError as je:
-            logger.error(f"JSON decode error in tool selector: {je}")
-            logger.error(f"Response content was: '{response.content}'")
+            result = safe_json_parse(response.content, "tool selector")
+        except Exception as je:
+            logger.error(f"Tool selection error: {je}")
             # Use fallback logic if JSON parsing fails
             raise je
         
@@ -251,8 +308,15 @@ def sql_generator_node(state: AgentState, config: AgentConfig) -> AgentState:
     doctor_uuid = state.get("doctor_id")
     doctor_id_mapped = None
     if doctor_uuid:
-        doctor_id_mapped = resolve_doctor_uuid_to_id(doctor_uuid)
-        logger.info(f"Mapped doctor UUID {doctor_uuid} to DoctorId {doctor_id_mapped}")
+        # Check if doctor_id is already an integer (direct DoctorId)
+        try:
+            # If it's already an integer, use it directly
+            doctor_id_mapped = int(doctor_uuid)
+            logger.info(f"Doctor ID {doctor_uuid} is already an integer DoctorId: {doctor_id_mapped}")
+        except ValueError:
+            # If it's not an integer, try to resolve UUID to DoctorId
+            doctor_id_mapped = resolve_doctor_uuid_to_id(doctor_uuid)
+            logger.info(f"Mapped doctor UUID {doctor_uuid} to DoctorId {doctor_id_mapped}")
     
     generation_context = {
         "selected_tool": state["selected_tool"],
@@ -296,10 +360,9 @@ Generate the appropriate SQL query using the mapped DoctorId. Respond in JSON fo
             raise ValueError("Empty response from OpenAI")
         
         try:
-            result = json.loads(response.content)
-        except json.JSONDecodeError as je:
+            result = safe_json_parse(response.content, "SQL generator")
+        except Exception as je:
             logger.error(f"JSON decode error: {je}")
-            logger.error(f"Response content was: '{response.content}'")
             # Try to extract SQL from non-JSON response
             content = response.content.strip()
             if "SELECT" in content.upper():
@@ -329,8 +392,42 @@ Generate the appropriate SQL query using the mapped DoctorId. Respond in JSON fo
             else:
                 final_params.append(param)
         
-        # Execute the query
+        # Execute the query and add observability metadata
         state["tool_results"] = execute_query(state["sql_query"], tuple(final_params))
+        
+        # Enhanced SQL logging for observability (to stdout)
+        print("=" * 80)
+        print("🗄️  SQL QUERY EXECUTION - LangGraph Medical Agent")
+        print("=" * 80)
+        print(f"📊 Tool: {state.get('selected_tool', 'unknown')}")
+        print(f"🔐 User Role: {state.get('user_role', 'unknown')}")
+        print(f"👤 Doctor ID: {state.get('doctor_id', 'N/A')}")
+        print(f"🆔 Session: {state.get('session_id', 'N/A')}")
+        print(f"📝 Original Query: {state.get('current_query', 'N/A')}")
+        print(f"🗄️  Generated SQL: {state['sql_query']}")
+        print(f"📊 Parameters: {final_params}")
+        print(f"📈 Result Count: {len(state['tool_results']) if state['tool_results'] else 0} rows")
+        print(f"⏰ Timestamp: {datetime.now().isoformat()}")
+        print("=" * 80)
+        
+        # Add SQL metadata to state for response inclusion
+        state["sql_metadata"] = {
+            "raw_query": state["sql_query"],
+            "parameters": final_params,
+            "parameter_mapping": {
+                "original_params": query_params,
+                "mapped_params": final_params,
+                "doctor_uuid_mapping": f"{doctor_uuid} -> {doctor_id_mapped}" if doctor_uuid and doctor_id_mapped else None
+            },
+            "result_count": len(state["tool_results"]) if state["tool_results"] else 0,
+            "generated_at": datetime.now().isoformat(),
+            "tool_name": state.get("selected_tool", "unknown"),
+            "user_context": {
+                "role": state.get("user_role", "unknown"),
+                "doctor_id": state.get("doctor_id"),
+                "session_id": state.get("session_id")
+            }
+        }
         
         logger.info(f"SQL executed: {state['sql_query']}, Params: {final_params}, Results: {len(state['tool_results']) if state['tool_results'] else 0} rows")
         
@@ -392,7 +489,9 @@ Respond in JSON format:
         ]
         
         response = config.llm.invoke(messages)
-        result = json.loads(response.content)
+        logger.info(f"Response formatter LLM output: {response.content}")
+        result = safe_json_parse(response.content, "response formatter")
+        logger.info(f"Parsed result: {result}")
         
         state["formatted_response"] = result.get("formatted_response", "I processed your request successfully.")
         state["response_metadata"] = result.get("response_metadata", {})

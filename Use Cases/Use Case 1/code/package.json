@@ -9,6 +9,8 @@
     "start-both": "python run_servers.py",
     "start-langgraph": "cd src && python api/langgraph_server.py",
     "start-mcp": "cd src && python api/mcp_server.py",
+    "start-ui": "streamlit run streamlit_app.py --server.port 8504 --server.address 127.0.0.1",
+    "start-full": "concurrently --raw -n LANGGRAPH,MCP,UI -c cyan,yellow,magenta \"cd src && python api/langgraph_server.py\" \"cd src && python api/mcp_server.py\" \"streamlit run streamlit_app.py --server.port 8504\"",
     "start-legacy": "cd legacy && python streamlit_app.py",
     "test": "echo \"No tests specified yet\" && exit 0"
   },

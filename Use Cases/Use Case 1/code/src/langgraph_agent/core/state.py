@@ -57,6 +57,7 @@ class AgentState(TypedDict):
     user_role: str  # "doctor" or "assistant"
     doctor_id: Optional[str]
     session_id: str
+    identity_context: Optional[Dict[str, Any]]  # Role-based identity information
     
     # Context management
     patient_context: Optional[PatientContext]
@@ -97,6 +98,7 @@ def create_initial_state(
         user_role=user_role,
         doctor_id=doctor_id,
         session_id=session_id,
+        identity_context=None,
         patient_context=None,
         doctor_context=DoctorContext(
             doctor_id=doctor_id or "",

@@ -101,7 +101,8 @@ class MedicalAssistantAgent:
         message: str, 
         session_id: str, 
         user_role: str, 
-        doctor_id: str = None
+        doctor_id: str = None,
+        identity_context: Dict[str, Any] = None
     ) -> Dict[str, Any]:
         """
         Process a user message through the agent graph.
@@ -112,6 +113,11 @@ class MedicalAssistantAgent:
         try:
             # Get or create session state
             state = self.get_or_create_session(session_id, user_role, doctor_id)
+            
+            # Add identity context to state if provided
+            if identity_context:
+                state["identity_context"] = identity_context
+                logger.info(f"Added identity context: {identity_context}")
             
             # Add user message to state
             state["current_query"] = message
@@ -130,6 +136,10 @@ class MedicalAssistantAgent:
             
             # Update session state
             self.sessions[session_id] = result
+            
+            # Debug logging
+            logger.info(f"Graph result - formatted_response: '{result['formatted_response']}'")
+            logger.info(f"Graph result - has_errors: {result['has_errors']}")
             
             # Return processed result
             return {

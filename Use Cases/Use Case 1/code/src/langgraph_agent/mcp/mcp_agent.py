@@ -87,7 +87,8 @@ class MCPMedicalAssistantAgent:
         session_id: str, 
         message: str, 
         user_role: str = "assistant", 
-        doctor_id: Optional[str] = None
+        doctor_id: Optional[str] = None,
+        identity_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Process a message with MCP-enhanced context preservation.
@@ -159,7 +160,8 @@ class MCPMedicalAssistantAgent:
         session_id: str, 
         message: str, 
         user_role: str = "assistant", 
-        doctor_id: Optional[str] = None
+        doctor_id: Optional[str] = None,
+        identity_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Synchronous wrapper for process_message for compatibility with existing API.
