@@ -128,6 +128,7 @@ class MedicalAssistantAgent:
             state["has_errors"] = False
             state["tool_results"] = None
             state["formatted_response"] = ""
+            state["sql_metadata"] = {}
             
             logger.info(f"Processing message for session {session_id}: {message}")
             
@@ -140,6 +141,8 @@ class MedicalAssistantAgent:
             # Debug logging
             logger.info(f"Graph result - formatted_response: '{result['formatted_response']}'")
             logger.info(f"Graph result - has_errors: {result['has_errors']}")
+            logger.info(f"Graph result keys: {list(result.keys())}")
+            logger.info(f"Graph result sql_metadata: {result.get('sql_metadata', 'NOT_FOUND')}")
             
             # Return processed result
             return {
@@ -147,6 +150,7 @@ class MedicalAssistantAgent:
                 "result": result["formatted_response"],
                 "metadata": result["response_metadata"],
                 "tool_name": result.get("selected_tool", "unknown"),
+                "sql_metadata": result.get("sql_metadata", {}),
                 "session_id": session_id,
                 "conversation_context": {
                     "patient_context": result.get("patient_context"),
