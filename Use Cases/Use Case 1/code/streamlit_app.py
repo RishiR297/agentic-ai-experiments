@@ -19,6 +19,37 @@ st.set_page_config(
 # API Configuration - Updated to match our refactored backend
 API_BASE_URL = "http://127.0.0.1:8001"
 
+def get_doctor_mappings():
+    """Get doctor ID to name mappings from the database."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect('code/src/db/output.db')
+        cursor = conn.cursor()
+        
+        # Get distinct doctor mappings, prioritizing by recent appointments
+        cursor.execute("""
+            SELECT DoctorId, DoctorName, COUNT(*) as appointment_count, MAX(StartDateTime) as latest_appointment
+            FROM view_appointments 
+            GROUP BY DoctorId, DoctorName
+            ORDER BY latest_appointment DESC, appointment_count DESC
+        """)
+        
+        mappings = {}
+        for doctor_id, doctor_name, count, latest in cursor.fetchall():
+            # Use the first (most recent/active) mapping for each doctor_id
+            if doctor_id not in mappings:
+                mappings[doctor_id] = {
+                    'name': doctor_name,
+                    'appointment_count': count,
+                    'latest_appointment': latest
+                }
+        
+        conn.close()
+        return mappings
+    except Exception as e:
+        st.error(f"Error loading doctor mappings: {e}")
+        return {1: {'name': 'Antonella', 'appointment_count': 0, 'latest_appointment': None}}
+
 def initialize_session_state():
     """Initialize session state variables if they don't exist."""
     if "chat_history" not in st.session_state:
@@ -38,6 +69,10 @@ def initialize_session_state():
     
     if "diagnostics_enabled" not in st.session_state:
         st.session_state.diagnostics_enabled = True
+    
+    # Load doctor mappings
+    if "doctor_mappings" not in st.session_state:
+        st.session_state.doctor_mappings = get_doctor_mappings()
 
 def get_mcp_context(session_id: str) -> Dict[str, Any]:
     """Get MCP context for a session from the MCP server."""
@@ -428,11 +463,35 @@ def main():
         
         # Doctor ID input (if doctor)
         if user_role == "doctor":
-            # Predefined doctor options for easy selection
-            doctor_options = {
-                "Dr. Antonella (ID: 1)": "1",
-                "Custom Doctor ID": "custom"
-            }
+            # Build doctor options from database mappings
+            doctor_mappings = st.session_state.doctor_mappings
+            doctor_options = {}
+            
+            # Add doctors from database
+            for doctor_id, info in doctor_mappings.items():
+                doctor_name = info['name']
+                appointment_count = info['appointment_count']
+                latest_appointment = info['latest_appointment']
+                
+                # Format display name with additional info
+                if latest_appointment:
+                    try:
+                        latest_date = datetime.fromisoformat(latest_appointment.replace(' ', 'T')).strftime("%Y-%m-%d")
+                        display_name = f"Dr. {doctor_name} (ID: {doctor_id}, {appointment_count} appts, latest: {latest_date})"
+                    except:
+                        display_name = f"Dr. {doctor_name} (ID: {doctor_id}, {appointment_count} appointments)"
+                else:
+                    display_name = f"Dr. {doctor_name} (ID: {doctor_id}, {appointment_count} appointments)"
+                
+                doctor_options[display_name] = str(doctor_id)
+            
+            # Add custom option
+            doctor_options["Custom Doctor ID"] = "custom"
+            
+            # Show doctor mappings info
+            st.write("**📋 Available Doctors from Database:**")
+            for doctor_id, info in doctor_mappings.items():
+                st.write(f"  • **{info['name']}** (ID: {doctor_id}) - {info['appointment_count']} appointments")
             
             selected_doctor = st.selectbox(
                 "Select Doctor:",
@@ -578,7 +637,22 @@ def main():
     
     # Show current role info
     role_color = "blue" if user_role == "doctor" else "green"
-    role_display = f"Dr. Antonella (ID: {st.session_state.doctor_id})" if user_role == "doctor" else "Assistant"
+    if user_role == "doctor":
+        # Get doctor name from mappings
+        doctor_mappings = st.session_state.doctor_mappings
+        doctor_id = st.session_state.doctor_id
+        try:
+            doctor_id_int = int(doctor_id)
+            if doctor_id_int in doctor_mappings:
+                doctor_name = doctor_mappings[doctor_id_int]['name']
+                role_display = f"Dr. {doctor_name} (ID: {doctor_id})"
+            else:
+                role_display = f"Doctor (ID: {doctor_id})"
+        except ValueError:
+            role_display = f"Doctor (ID: {doctor_id})"
+    else:
+        role_display = "Assistant"
+    
     st.markdown(f"**Current Role:** :{role_color}[{role_display}]")
     
     # Display chat history
