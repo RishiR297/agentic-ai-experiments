@@ -124,12 +124,18 @@ def resolve_doctor_name_from_uuid(doctor_uuid: str) -> Optional[str]:
 
 
 def get_next_appointment(doctor_uuid: str) -> List[Dict]:
-    """Get the next upcoming appointment for a doctor using UUID."""
-    # Map UUID to integer DoctorId
-    doctor_id = resolve_doctor_uuid_to_id(doctor_uuid)
-    if doctor_id is None:
-        logger.warning(f"Could not map doctor UUID {doctor_uuid} to DoctorId")
-        return []
+    """Get the next upcoming appointment for a doctor using UUID or direct DoctorId."""
+    # Check if doctor_uuid is already an integer DoctorId
+    try:
+        doctor_id = int(doctor_uuid)
+        logger.info(f"Using direct DoctorId: {doctor_id}")
+    except ValueError:
+        # If not an integer, try to map UUID to integer DoctorId
+        doctor_id = resolve_doctor_uuid_to_id(doctor_uuid)
+        if doctor_id is None:
+            logger.warning(f"Could not map doctor UUID {doctor_uuid} to DoctorId")
+            return []
+        logger.info(f"Mapped UUID {doctor_uuid} to DoctorId: {doctor_id}")
     
     query = """
     SELECT * FROM View_Appointments 
