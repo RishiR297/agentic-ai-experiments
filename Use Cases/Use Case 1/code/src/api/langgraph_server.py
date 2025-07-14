@@ -227,6 +227,34 @@ async def execute_tool(
     """
     return await chat_endpoint(request, x_user_role, x_doctor_id, x_session_id)
 
+@app.get("/context/{session_id}")
+async def get_context(session_id: str):
+    """
+    Get current context state for a given session.
+    Returns conversation memory and reference resolution.
+    """
+    try:
+        context = agent.get_session_context(session_id)
+        if not context:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        return {
+            "session_id": session_id,
+            "context": context,
+            "timestamp": datetime.now().isoformat(),
+            "memory_summary": {
+                "message_count": context.get("message_count", 0),
+                "has_patient_context": bool(context.get("patient_context")),
+                "has_doctor_context": bool(context.get("doctor_context")),
+                "recent_queries": context.get("recent_queries", []),
+                "conversation_memory": context.get("conversation_memory", {})
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Get context error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/session/{session_id}/context")
 async def get_session_context(session_id: str):
     """Get current context for a specific session."""
@@ -320,6 +348,127 @@ async def get_available_tools(
     except Exception as e:
         logger.error(f"Get tools error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/mcp/summary")
+async def get_mcp_summary():
+    """
+    Get MCP (Model Context Protocol) system summary.
+    Shows structured context metadata and relevance scoring.
+    """
+    try:
+        # Get MCP context from agent if available
+        mcp_summary = {
+            "mcp_enabled": True,
+            "context_preservation": "enhanced",
+            "reference_resolution": "advanced",
+            "context_scoring": "relevance_based",
+            "max_context_items": 5,
+            "features": [
+                "Multi-turn conversation memory",
+                "Context preservation across turns",
+                "Advanced reference resolution",
+                "Structured context metadata",
+                "Relevance-based context scoring"
+            ],
+            "active_sessions": len(agent.list_active_sessions()),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return mcp_summary
+        
+    except Exception as e:
+        logger.error(f"MCP summary error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/demo/test")
+async def demo_test():
+    """
+    Demo endpoint for API testing.
+    Returns sample request/response format.
+    """
+    return {
+        "api_name": "LangGraph Medical Assistant API",
+        "version": "4.0",
+        "sample_request": {
+            "method": "POST",
+            "endpoint": "/chat",
+            "headers": {
+                "X-User-Role": "doctor",
+                "X-Doctor-ID": "1",
+                "Content-Type": "application/json"
+            },
+            "body": {
+                "message": "Who's my next patient?",
+                "session_id": "doctor_1_20250714"
+            }
+        },
+        "sample_response": {
+            "success": True,
+            "result": "Your next patient is Eva Davis at 2:00 PM for a Facial.",
+            "session_id": "doctor_1_20250714",
+            "tool_name": "appointment_lookup",
+            "sql_metadata": {
+                "raw_query": "SELECT * FROM View_Appointments WHERE...",
+                "parameters": [1],
+                "result_count": 1,
+                "query_type": "next_patient"
+            },
+            "conversation_context": {
+                "query_intent": "next_patient",
+                "resolved_references": {}
+            }
+        },
+        "available_endpoints": [
+            "POST /chat - Main chat interface",
+            "GET /context/{session_id} - Session context",
+            "GET /tools - Available tools by role",
+            "GET /health - Health check",
+            "GET /mcp/summary - MCP system summary",
+            "GET /demo/test - This demo endpoint"
+        ]
+    }
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint with API information and usage guide.
+    """
+    return {
+        "name": "LangGraph Medical Assistant API",
+        "version": "4.0",
+        "description": "Multi-turn conversational medical assistant with context and memory",
+        "features": [
+            "LangGraph-based conversation flow",
+            "Context preservation across turns", 
+            "Advanced reference resolution",
+            "Role-based access control",
+            "SQL query generation with LLM",
+            "MCP integration",
+            "Full observability and debugging"
+        ],
+        "endpoints": {
+            "POST /chat": "Main chat interface with role-based access",
+            "GET /context/{session_id}": "Get conversation context and memory",
+            "GET /tools": "List available tools for user role",
+            "GET /health": "Health check and system status",
+            "GET /mcp/summary": "MCP system summary and features",
+            "GET /demo/test": "Demo endpoint with sample usage",
+            "GET /docs": "Swagger UI documentation",
+            "GET /redoc": "ReDoc documentation"
+        },
+        "usage": {
+            "authentication": "Use headers: X-User-Role, X-Doctor-ID",
+            "roles": ["doctor", "assistant"],
+            "session_management": "Automatic session ID generation if not provided",
+            "testing": "Access /docs for interactive API testing"
+        },
+        "public_access": {
+            "swagger_ui": f"http://0.0.0.0:8502/docs",
+            "redoc": f"http://0.0.0.0:8502/redoc",
+            "ngrok_ready": True,
+            "lan_access": "0.0.0.0:8502"
+        }
+    }
 
 # Startup event
 @app.on_event("startup")
