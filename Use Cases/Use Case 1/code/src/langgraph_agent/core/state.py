@@ -74,6 +74,7 @@ class AgentState(TypedDict):
     tool_parameters: Dict[str, Any]
     tool_results: Any
     sql_query: Optional[str]
+    sql_metadata: Dict[str, Any]  # LLM SQL generation metadata
     
     # Response generation
     formatted_response: str
@@ -120,6 +121,7 @@ def create_initial_state(
         tool_parameters={},
         tool_results=None,
         sql_query=None,
+        sql_metadata={},
         formatted_response="",
         response_metadata={},
         errors=[],
