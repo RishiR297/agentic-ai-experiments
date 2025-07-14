@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph_agent.core.config import AgentConfig
@@ -55,6 +55,45 @@ def clean_json_response(response_content: str) -> str:
     return '\n'.join(cleaned_lines).strip()
 
 
+def preprocess_date_references(query: str) -> Dict[str, str]:
+    """
+    Preprocess date references like 'tomorrow', 'today', 'next week' etc.
+    Returns a mapping of date references to actual dates.
+    """
+    date_mappings = {}
+    current_date = datetime.now()
+    
+    query_lower = query.lower()
+    
+    # Handle today
+    if 'today' in query_lower:
+        date_mappings['today'] = current_date.strftime('%Y-%m-%d')
+    
+    # Handle tomorrow
+    if 'tomorrow' in query_lower:
+        tomorrow_date = current_date + timedelta(days=1)
+        date_mappings['tomorrow'] = tomorrow_date.strftime('%Y-%m-%d')
+    
+    # Handle yesterday
+    if 'yesterday' in query_lower:
+        yesterday_date = current_date - timedelta(days=1)
+        date_mappings['yesterday'] = yesterday_date.strftime('%Y-%m-%d')
+    
+    # Handle next week
+    if 'next week' in query_lower:
+        next_week_date = current_date + timedelta(days=7)
+        date_mappings['next week'] = next_week_date.strftime('%Y-%m-%d')
+    
+    # Handle this week
+    if 'this week' in query_lower:
+        # Find the start of this week (Monday)
+        days_since_monday = current_date.weekday()
+        week_start = current_date - timedelta(days=days_since_monday)
+        date_mappings['this week'] = week_start.strftime('%Y-%m-%d')
+    
+    return date_mappings
+
+
 def safe_json_parse(response_content: str, node_name: str) -> Dict[str, Any]:
     """
     Safely parse JSON response with cleaning and error handling.
@@ -94,6 +133,10 @@ def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
     
     session_id = state.get("session_id", "default_session")
     
+    # Preprocess date references before other processing
+    date_mappings = preprocess_date_references(state["current_query"])
+    logger.info(f"Date mappings found: {date_mappings}")
+    
     # First, try MCP context resolution for better reference handling
     mcp_resolved_refs = {}
     query_lower = state["current_query"].lower()
@@ -113,7 +156,7 @@ def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
     
     system_prompt = config.get_system_prompt("context_resolver")
     
-    # Enhanced context information including MCP context
+    # Enhanced context information including MCP context and date mappings
     mcp_context_summary = mcp_context_manager.get_context_summary(session_id)
     
     context_info = {
@@ -125,21 +168,30 @@ def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
         "conversation_memory": state["conversation_memory"],
         "recent_messages": [msg.content for msg in state["messages"][-3:] if hasattr(msg, 'content')],
         "mcp_context_summary": mcp_context_summary,
-        "mcp_resolved_references": mcp_resolved_refs
+        "mcp_resolved_references": mcp_resolved_refs,
+        "date_mappings": date_mappings,
+        "current_date": datetime.now().strftime('%Y-%m-%d')
     }
     
     prompt = f"""
 {system_prompt}
 
-Current context (enhanced with MCP):
+Current context (enhanced with MCP and date preprocessing):
 {json.dumps(context_info, indent=2, default=str)}
+
+IMPORTANT DATE PROCESSING:
+- Current date: {datetime.now().strftime('%Y-%m-%d')}
+- Date mappings: {date_mappings}
+- When the query mentions "tomorrow", use date: {date_mappings.get('tomorrow', 'N/A')}
+- When the query mentions "today", use date: {date_mappings.get('today', 'N/A')}
 
 Analyze the query "{state['current_query']}" and provide:
 1. query_intent: The main intent (next_patient, patient_history, schedule, etc.)
-2. resolved_references: Dictionary mapping implicit references to explicit values
+2. resolved_references: Dictionary mapping implicit references to explicit values (MUST include actual dates for temporal references)
 3. context_updates: Any updates needed to patient or doctor context
 
 Use MCP-resolved references when available for better accuracy.
+Use the preprocessed date mappings for temporal references like "tomorrow", "today", etc.
 
 Respond in JSON format:
 {{
@@ -175,9 +227,9 @@ Respond in JSON format:
         # Update state with resolved information
         state["query_intent"] = result.get("query_intent")
         
-        # Merge MCP-resolved references with LLM-resolved references
+        # Merge date mappings, MCP-resolved references, and LLM-resolved references
         llm_resolved = result.get("resolved_references", {})
-        final_resolved = {**mcp_resolved_refs, **llm_resolved}
+        final_resolved = {**date_mappings, **mcp_resolved_refs, **llm_resolved}
         state["resolved_references"] = final_resolved
         
         # Apply context updates
@@ -473,7 +525,15 @@ def response_formatter_node(state: AgentState, config: AgentConfig) -> AgentStat
 Formatting context:
 {json.dumps(formatting_context, indent=2, default=str)}
 
-Format a helpful, natural response. Include relevant context and suggest follow-up actions if appropriate.
+CRITICAL INSTRUCTION: 
+- When formatting a response for a specific date query (like "tomorrow" or "today"), ONLY use the tool_results data.
+- Do NOT mix cached context data with current query results.
+- The tool_results contain the EXACT data requested for the specific query.
+- Original query: "{state['current_query']}"
+- Query intent: {state['query_intent']}
+- Resolved date references: {state.get('resolved_references', {}).get('tomorrow', 'N/A')} / {state.get('resolved_references', {}).get('today', 'N/A')}
+
+Format a helpful, natural response based ONLY on the tool_results. Include relevant context and suggest follow-up actions if appropriate.
 Respond in JSON format:
 {{
     "formatted_response": "...",
