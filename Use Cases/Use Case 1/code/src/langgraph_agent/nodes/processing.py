@@ -179,16 +179,26 @@ def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
 Current context (enhanced with MCP and date preprocessing):
 {json.dumps(context_info, indent=2, default=str)}
 
-IMPORTANT DATE PROCESSING:
+IMPORTANT DATE AND TIME PROCESSING:
 - Current date: {datetime.now().strftime('%Y-%m-%d')}
 - Date mappings: {date_mappings}
 - When the query mentions "tomorrow", use date: {date_mappings.get('tomorrow', 'N/A')}
 - When the query mentions "today", use date: {date_mappings.get('today', 'N/A')}
 
+TIME-SPECIFIC QUERY DETECTION:
+- If query contains specific times (e.g., "2 PM", "10:30", "at 3", "9 AM"), classify as "time_specific_lookup"
+- If query asks about "next patient" or "who's next", classify as "next_patient"
+- If query asks about general schedule ("my appointments", "schedule today"), classify as "schedule"
+- Time patterns to detect: [time][AM/PM], [hour]:[minute], "at [time]", "who's at [time]"
+
 Analyze the query "{state['current_query']}" and provide:
-1. query_intent: The main intent (next_patient, patient_history, schedule, etc.)
+1. query_intent: Choose from (time_specific_lookup, next_patient, schedule, patient_history, availability)
+   - Use "time_specific_lookup" for queries with specific times like "Who's at 2 PM?"
+   - Use "next_patient" only for queries asking about the chronologically next patient
+   - Use "schedule" for general schedule viewing requests
 2. resolved_references: Dictionary mapping implicit references to explicit values (MUST include actual dates for temporal references)
 3. context_updates: Any updates needed to patient or doctor context
+4. reasoning: Explain why this intent was chosen and how time references were interpreted
 
 Use MCP-resolved references when available for better accuracy.
 Use the preprocessed date mappings for temporal references like "tomorrow", "today", etc.
@@ -289,11 +299,22 @@ def tool_selector_node(state: AgentState, config: AgentConfig) -> AgentState:
 Selection context:
 {json.dumps(selection_context, indent=2, default=str)}
 
+TOOL SELECTION GUIDELINES:
+- For "time_specific_lookup" intent: Use "schedule_query" with specific time filtering
+- For "next_patient" intent: Use "appointment_lookup" to find chronologically next appointment
+- For "schedule" intent: Use "schedule_query" for general schedule viewing
+- For "patient_history" intent: Use "patient_lookup" or "history_query"
+
+TIME-SPECIFIC HANDLING:
+- If resolved_references contains specific times (e.g., "2 PM", "14:00"), this indicates a time-specific lookup
+- Generate parameters that will filter by the specific time mentioned
+- For time-specific queries, include both date and time constraints in parameters
+
 Select the best tool and parameters. Respond in JSON format:
 {{
     "selected_tool": "tool_name",
     "tool_parameters": {{}},
-    "reasoning": "..."
+    "reasoning": "Explain tool choice and parameter generation, especially for time-specific queries"
 }}
 """
     
@@ -372,7 +393,19 @@ def sql_generator_node(state: AgentState, config: AgentConfig) -> AgentState:
         "doctor_id_mapped": doctor_id_mapped,
         "patient_context": state.get("patient_context"),
         "current_date": datetime.now().strftime("%Y-%m-%d"),
-        "current_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "current_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time_conversion_guide": {
+            "12_hour_to_24_hour": {
+                "12 AM": "00:00", "1 AM": "01:00", "2 AM": "02:00", "3 AM": "03:00",
+                "4 AM": "04:00", "5 AM": "05:00", "6 AM": "06:00", "7 AM": "07:00", 
+                "8 AM": "08:00", "9 AM": "09:00", "10 AM": "10:00", "11 AM": "11:00",
+                "12 PM": "12:00", "1 PM": "13:00", "2 PM": "14:00", "3 PM": "15:00",
+                "4 PM": "16:00", "5 PM": "17:00", "6 PM": "18:00", "7 PM": "19:00",
+                "8 PM": "20:00", "9 PM": "21:00", "10 PM": "22:00", "11 PM": "23:00"
+            },
+            "time_patterns": ["at", "PM", "AM", ":", "o'clock", "sharp", "exactly"]
+        },
+        "resolved_time_references": state.get("resolved_references", {})
     }
     
     prompt = f"""
@@ -388,15 +421,23 @@ DATABASE SCHEMA INFORMATION:
 
 QUERY TYPE PATTERNS:
 1. NEXT_PATIENT: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND StartDateTime > datetime('now') ORDER BY StartDateTime ASC LIMIT 1"
-2. PATIENT_HISTORY: "SELECT * FROM View_Appointments WHERE PatientName LIKE ? OR PatientId = ? ORDER BY StartDateTime DESC"
-3. DOCTOR_SCHEDULE: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? ORDER BY StartDateTime"
-4. TODAY_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') ORDER BY StartDateTime"
-5. TOMORROW_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now', '+1 day') ORDER BY StartDateTime"
+2. TIME_SPECIFIC_LOOKUP: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? AND strftime('%H:%M', StartDateTime) = ? ORDER BY StartDateTime"
+3. PATIENT_HISTORY: "SELECT * FROM View_Appointments WHERE PatientName LIKE ? OR PatientId = ? ORDER BY StartDateTime DESC"
+4. DOCTOR_SCHEDULE: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? ORDER BY StartDateTime"
+5. TODAY_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') ORDER BY StartDateTime"
+6. TOMORROW_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now', '+1 day') ORDER BY StartDateTime"
+
+TIME-SPECIFIC QUERY HANDLING:
+- For queries like "Who's at 2 PM?", use TIME_SPECIFIC_LOOKUP pattern
+- Convert time references: "2 PM" → "14:00", "9 AM" → "09:00", "10:30" → "10:30"
+- Time-specific queries should filter by BOTH date AND time
+- Example: "Who's at 2 PM today?" → WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') AND strftime('%H:%M', StartDateTime) = '14:00'
 
 IMPORTANT MAPPINGS:
 - Use DoctorId {doctor_id_mapped} for doctor queries (NOT the UUID)
 - For date references, use the resolved dates from context: {generation_context.get('resolved_references', {})}
 - Patient references should use LIKE '%name%' for partial matching
+- Time references should be converted to 24-hour format (HH:MM)
 
 Generation context:
 {json.dumps(generation_context, indent=2, default=str)}
