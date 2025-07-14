@@ -13,7 +13,9 @@ from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 # Database path - adjusted for running from src directory
-DB_PATH = "../data/db/output.db"
+import os
+DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'db', 'output.db')
+DB_PATH = os.path.abspath(DB_PATH)
 
 
 def get_db_connection():
