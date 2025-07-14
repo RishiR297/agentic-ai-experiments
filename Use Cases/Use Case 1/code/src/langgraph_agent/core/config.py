@@ -56,7 +56,17 @@ Key responsibilities:
 1. Identify implicit references like "next patient", "she", "her", "that appointment", "my schedule"
 2. Resolve these references using patient_context, doctor_context, and conversation_memory
 3. Update resolved_references with explicit mappings
-4. Determine query_intent (next_patient, patient_history, schedule, availability, etc.)
+4. Determine query_intent (next_patient, patient_history, schedule, availability, time_specific_lookup, etc.)
+
+TIME-SPECIFIC QUERY DETECTION:
+CRITICAL: Look for specific time patterns in user queries:
+- Time mentions: "2 PM", "10:30", "at 3", "9 AM", "14:00", "3:30 PM"
+- Time-specific phrases: "at [time]", "who's at", "appointment at", "scheduled for"
+- Examples:
+  * "Who's at 2 PM?" → intent: "time_specific_lookup" (NOT next_patient)
+  * "What appointments are at 3 PM?" → intent: "time_specific_lookup"
+  * "Who's my next patient?" → intent: "next_patient"
+  * "Who's coming next?" → intent: "next_patient"
 
 Context resolution patterns:
 - "next patient" → Look for upcoming appointment in doctor's schedule
@@ -64,6 +74,13 @@ Context resolution patterns:
 - "that appointment" → Use recent appointment mentioned in conversation
 - "my schedule" → Refers to doctor's schedule when user_role is doctor
 - "available slots" → Query doctor availability
+- TIME-SPECIFIC queries → Extract time and date for precise appointment lookup
+
+INTENT CLASSIFICATION RULES:
+- If query contains specific time patterns → "time_specific_lookup"
+- If query asks for "next" without specific time → "next_patient"
+- If query asks for schedule overview → "schedule"
+- If query asks about patient history → "patient_history"
 
 Always preserve the original query while adding resolved context.
 """,
@@ -78,12 +95,20 @@ Available tools:
 4. doctor_availability - Check when doctors are available
 5. calendar_summary - Summarize schedule for a day/week
 
-Selection logic:
+TOOL SELECTION GUIDELINES:
 - next_patient intent → appointment_lookup for next upcoming appointment
 - patient_history intent → patient_history with patient ID
 - schedule intent → schedule_query with doctor and date
 - availability intent → doctor_availability 
 - summary intent → calendar_summary
+- time_specific_lookup intent → schedule_query with doctor, date, and time parameters
+
+TIME-SPECIFIC HANDLING:
+CRITICAL: For time_specific_lookup intent:
+- Use schedule_query tool (NOT appointment_lookup)
+- Include time parameter in tool_parameters
+- Extract specific time from query (e.g., "2 PM" → "14:00")
+- Include both date and time for precise filtering
 
 Generate precise tool parameters based on resolved references and context.
 """,
@@ -102,11 +127,28 @@ IMPORTANT NOTES:
 - Date comparisons should use DATE() function for date-only matching
 - Use datetime('now') for current timestamp comparisons
 
-Query patterns:
-1. Today's appointments: SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') ORDER BY StartDateTime
-2. Next appointment: SELECT * FROM View_Appointments WHERE DoctorId = ? AND StartDateTime > datetime('now') ORDER BY StartDateTime LIMIT 1
-3. Patient history: SELECT * FROM View_Appointments WHERE PatientName LIKE ? OR PatientId = ? ORDER BY StartDateTime DESC
-4. Doctor schedule for date: SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? ORDER BY StartDateTime
+QUERY TYPE PATTERNS:
+1. NEXT_PATIENT: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND StartDateTime > datetime('now') ORDER BY StartDateTime ASC LIMIT 1"
+2. TIME_SPECIFIC_LOOKUP: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? AND strftime('%H:%M', StartDateTime) = ? ORDER BY StartDateTime"
+3. PATIENT_HISTORY: "SELECT * FROM View_Appointments WHERE PatientName LIKE ? OR PatientId = ? ORDER BY StartDateTime DESC"
+4. DOCTOR_SCHEDULE: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? ORDER BY StartDateTime"
+5. TODAY_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') ORDER BY StartDateTime"
+6. TOMORROW_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now', '+1 day') ORDER BY StartDateTime"
+
+TIME-SPECIFIC QUERY HANDLING:
+- For queries like "Who's at 2 PM?", use TIME_SPECIFIC_LOOKUP pattern
+- Convert time references: "2 PM" → "14:00", "9 AM" → "09:00", "10:30" → "10:30"
+- Time-specific queries should filter by BOTH date AND time
+- Example: "Who's at 2 PM today?" → WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') AND strftime('%H:%M', StartDateTime) = '14:00'
+- Parameters: [doctor_id, "2024-01-15", "14:00"] for a specific date, or [doctor_id] + DATE('now') + "14:00" for today
+
+PARAMETER GENERATION:
+- TIME_SPECIFIC_LOOKUP needs: [doctor_id, date_string, time_24h_format]
+- NEXT_PATIENT needs: [doctor_id]
+- Use YYYY-MM-DD format for dates
+- Use HH:MM format for times (24-hour)
+- Utilize resolved_references from context for date values
+- Convert 12-hour to 24-hour using provided time_conversion_guide
 
 Always use parameterized queries for security. Use the mapped integer DoctorId, not the UUID.
 """,
