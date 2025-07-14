@@ -11,11 +11,13 @@ from typing import List, Dict, Any, Optional
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
-
+logging.basicConfig(level=logging.INFO)
 # Database path - adjusted for running from src directory
 import os
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'db', 'output.db')
+
+DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'db', 'output.db')
 DB_PATH = os.path.abspath(DB_PATH)
+logger.info(f"Resolved database path: {DB_PATH}")
 
 
 def get_db_connection():
