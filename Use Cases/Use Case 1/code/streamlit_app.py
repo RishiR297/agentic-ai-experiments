@@ -1,6 +1,6 @@
 """
 Streamlit Web Interface for LangGraph Medical Assistant
-Provides a user-friendly chat interface for doctors and assistants.
+Provides a user-friendly chat interface for doctors and assistants with detailed diagnostics.
 """
 import streamlit as st
 import requests
@@ -35,6 +35,31 @@ def initialize_session_state():
     
     if "conversation_id" not in st.session_state:
         st.session_state.conversation_id = None
+    
+    if "diagnostics_enabled" not in st.session_state:
+        st.session_state.diagnostics_enabled = True
+
+def get_mcp_context(session_id: str) -> Dict[str, Any]:
+    """Get MCP context for a session from the MCP server."""
+    try:
+        response = requests.get(f"http://localhost:8002/context/{session_id}", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"HTTP {response.status_code}", "context": {}}
+    except Exception as e:
+        return {"error": str(e), "context": {}}
+
+def get_mcp_summary() -> Dict[str, Any]:
+    """Get overall MCP system summary."""
+    try:
+        response = requests.get("http://localhost:8002/mcp/summary", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
 
 def send_chat_message(message: str, user_role: str, doctor_id: str = None) -> Dict[str, Any]:
     """Send a message to the backend API with proper role-based headers."""
@@ -67,7 +92,10 @@ def send_chat_message(message: str, user_role: str, doctor_id: str = None) -> Di
                 "response": response_data.get("result", "No response"),
                 "success": response_data.get("success", False),
                 "tool_name": response_data.get("tool_name", "unknown"),
-                "metadata": response_data.get("metadata", {})
+                "metadata": response_data.get("metadata", {}),
+                "sql_metadata": response_data.get("sql_metadata", {}),
+                "conversation_context": response_data.get("conversation_context", {}),
+                "session_id": response_data.get("session_id", "unknown")
             }
         else:
             return {
@@ -127,7 +155,7 @@ def check_system_health() -> Dict[str, bool]:
     return health_status
 
 def render_chat_message(role: str, content: str, timestamp: str = None, metadata: Dict = None):
-    """Render a chat message with proper styling."""
+    """Render a chat message with comprehensive diagnostic information."""
     if timestamp is None:
         timestamp = datetime.now().strftime("%H:%M:%S")
     
@@ -140,15 +168,234 @@ def render_chat_message(role: str, content: str, timestamp: str = None, metadata
             st.markdown(f"**Medical Assistant** ({timestamp})")
             st.markdown(content)
             
-            # Show metadata if available
-            if metadata:
-                with st.expander("🔍 Response Details"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if "intent" in metadata:
-                            st.write(f"**Intent:** {metadata['intent']}")
-                        if "tools_used" in metadata:
-                            st.write(f"**Tools Used:** {metadata['tools_used']}")
+            # Enhanced diagnostics panel
+            if metadata and st.session_state.get("diagnostics_enabled", True):
+                with st.expander("🔍 **Response Diagnostics & MCP Context**", expanded=False):
+                    
+                    # Create tabs for different diagnostic views
+                    tab1, tab2, tab3, tab4 = st.tabs(["🎯 Processing Flow", "🧠 MCP Context", "🗄️ SQL Details", "🔧 Technical Metadata"])
+                    
+                    with tab1:
+                        st.subheader("Processing Flow")
+                        
+                        # Show the processing pipeline
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.write("**🔤 Original Query:**")
+                            st.code(metadata.get("original_query", content), language="text")
+                            
+                            if "intent" in metadata:
+                                st.write(f"**🎯 Intent Detected:** `{metadata['intent']}`")
+                            
+                            if "tool_name" in metadata:
+                                st.write(f"**🛠️ Tool Selected:** `{metadata['tool_name']}`")
+                        
+                        with col2:
+                            if "conversation_context" in metadata:
+                                ctx = metadata["conversation_context"]
+                                if "resolved_references" in ctx:
+                                    st.write("**� Reference Resolution:**")
+                                    refs = ctx["resolved_references"]
+                                    if refs:
+                                        for ref, resolution in refs.items():
+                                            if isinstance(resolution, str):
+                                                st.write(f"  • `{ref}` → {resolution}")
+                                            else:
+                                                st.write(f"  • `{ref}` → [Complex Object]")
+                                    else:
+                                        st.write("  • No references to resolve")
+                                
+                                if "query_intent" in ctx:
+                                    st.write(f"**💭 Query Intent:** {ctx['query_intent']}")
+                    
+                    with tab2:
+                        st.subheader("🧠 MCP Context Memory")
+                        
+                        # Get MCP context for this session
+                        session_id = metadata.get("session_id", "streamlit_doctor_1")
+                        mcp_data = get_mcp_context(session_id)
+                        
+                        if "error" not in mcp_data:
+                            context = mcp_data.get("context", {})
+                            
+                            if context:
+                                # Show context summary
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("Context Items", len(context))
+                                    
+                                    # Show context types
+                                    context_types = {}
+                                    for item in context.values():
+                                        item_type = item.get("context_type", "unknown")
+                                        context_types[item_type] = context_types.get(item_type, 0) + 1
+                                    
+                                    st.write("**Context Types:**")
+                                    for ctx_type, count in context_types.items():
+                                        st.write(f"  • {ctx_type}: {count}")
+                                
+                                with col2:
+                                    # Show recent context items (limit to 5 most recent)
+                                    st.write("**Recent Context (Last 5):**")
+                                    sorted_items = sorted(
+                                        context.items(), 
+                                        key=lambda x: x[1].get("queried_at", ""), 
+                                        reverse=True
+                                    )[:5]
+                                    
+                                    for key, item in sorted_items:
+                                        item_type = item.get("context_type", "unknown")
+                                        timestamp_str = item.get("queried_at", "")
+                                        if timestamp_str:
+                                            try:
+                                                ts = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                                                time_display = ts.strftime("%H:%M:%S")
+                                            except:
+                                                time_display = timestamp_str
+                                        else:
+                                            time_display = "unknown"
+                                        
+                                        st.write(f"  • **{item_type}** ({time_display})")
+                                        if item_type == "schedule" and "schedule_data" in item:
+                                            patient_count = len(item["schedule_data"])
+                                            st.write(f"    └── {patient_count} appointments")
+                                
+                                # Detailed context view
+                                st.write("**📋 Detailed Context Data:**")
+                                
+                                for i, (key, item) in enumerate(sorted_items):
+                                    st.write(f"**Context {i+1}: {key} ({item.get('context_type', 'unknown')})**")
+                                    
+                                    # Show context item details
+                                    if item.get("context_type") == "schedule" and "schedule_data" in item:
+                                        schedule_data = item["schedule_data"]
+                                        st.write(f"📅 **Schedule for {item.get('date', 'unknown date')}:**")
+                                        for appointment in schedule_data:
+                                            patient_name = appointment.get("PatientName", "Unknown")
+                                            start_time = appointment.get("StartDateTime", "")
+                                            service = appointment.get("ServiceName", "Unknown")
+                                            if start_time:
+                                                try:
+                                                    time_obj = datetime.fromisoformat(start_time.replace(' ', 'T'))
+                                                    time_display = time_obj.strftime("%I:%M %p")
+                                                except:
+                                                    time_display = start_time
+                                            else:
+                                                time_display = "Unknown time"
+                                            st.write(f"  • {patient_name} at {time_display} for {service}")
+                                    else:
+                                        # Show raw context data in a code block
+                                        st.code(json.dumps(item, indent=2, default=str), language="json")
+                                    
+                                    st.write("")  # Add spacing between items
+                            else:
+                                st.info("No MCP context available for this session")
+                        else:
+                            st.error(f"Failed to retrieve MCP context: {mcp_data.get('error', 'Unknown error')}")
+                    
+                    with tab3:
+                        st.subheader("🗄️ SQL Query Details")
+                        
+                        if "sql_metadata" in metadata and metadata["sql_metadata"]:
+                            sql_meta = metadata["sql_metadata"]
+                            
+                            # LLM Reasoning section
+                            if "llm_reasoning" in sql_meta:
+                                st.write("**🧠 LLM SQL Generation Reasoning:**")
+                                st.info(sql_meta["llm_reasoning"])
+                            
+                            if "query_type" in sql_meta:
+                                st.write(f"**🔍 Query Type:** `{sql_meta['query_type']}`")
+                            
+                            if "execution_method" in sql_meta:
+                                method = sql_meta["execution_method"]
+                                method_color = "🤖" if method == "llm_generated_sql" else "🔧"
+                                st.write(f"**{method_color} Execution Method:** `{method}`")
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                if "raw_query" in sql_meta:
+                                    st.write("**Generated SQL Query:**")
+                                    st.code(sql_meta["raw_query"], language="sql")
+                                
+                                if "parameters" in sql_meta:
+                                    st.write("**Query Parameters:**")
+                                    params = sql_meta["parameters"]
+                                    if params:
+                                        for i, param in enumerate(params):
+                                            st.write(f"  • Parameter {i+1}: `{param}`")
+                                    else:
+                                        st.write("  • No parameters")
+                                
+                                # Query evaluation context
+                                if "query_evaluation" in sql_meta:
+                                    eval_data = sql_meta["query_evaluation"]
+                                    st.write("**📊 Query Evaluation:**")
+                                    st.write(f"  • Intent: `{eval_data.get('intent', 'unknown')}`")
+                                    st.write(f"  • Context Used: `{eval_data.get('context_used', False)}`")
+                                    if eval_data.get("resolved_references"):
+                                        st.write(f"  • References: `{len(eval_data['resolved_references'])} resolved`")
+                            
+                            with col2:
+                                if "result_count" in sql_meta:
+                                    st.metric("Results Returned", sql_meta["result_count"])
+                                
+                                if "execution_time" in sql_meta:
+                                    st.metric("Execution Time", f"{sql_meta['execution_time']}ms")
+                                
+                                if "generated_at" in sql_meta:
+                                    gen_time = sql_meta["generated_at"]
+                                    st.write(f"**⏰ Generated At:** {gen_time[:19]}")
+                                
+                                # Parameter mapping details
+                                if "parameter_mapping" in sql_meta:
+                                    param_map = sql_meta["parameter_mapping"]
+                                    if param_map.get("doctor_uuid_mapping"):
+                                        st.write("**🔗 Doctor Mapping:**")
+                                        st.code(param_map["doctor_uuid_mapping"], language="text")
+                                
+                                if "tool_name" in sql_meta:
+                                    st.write(f"**Tool Used:** {sql_meta['tool_name']}")
+                        else:
+                            st.info("No SQL query was executed for this response")
+                    
+                    with tab4:
+                        st.subheader("🔧 Technical Metadata")
+                        
+                        # Show all metadata in a structured way
+                        if metadata:
+                            # User context
+                            if "identity_context" in metadata:
+                                id_ctx = metadata["identity_context"]
+                                st.write("**👤 User Identity:**")
+                                st.write(f"  • Role: {id_ctx.get('role', 'unknown')}")
+                                st.write(f"  • Doctor ID: {id_ctx.get('doctor_id', 'N/A')}")
+                                st.write(f"  • Session: {id_ctx.get('timestamp', 'N/A')}")
+                            
+                            # Response metadata
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write("**📊 Response Metadata:**")
+                                for key, value in metadata.items():
+                                    if key not in ["conversation_context", "sql_metadata", "identity_context"]:
+                                        if isinstance(value, (str, int, float, bool)):
+                                            st.write(f"  • {key}: `{value}`")
+                            
+                            with col2:
+                                # Show conversation context
+                                if "conversation_context" in metadata:
+                                    conv_ctx = metadata["conversation_context"]
+                                    st.write("**💬 Conversation Context:**")
+                                    for key, value in conv_ctx.items():
+                                        if isinstance(value, (str, int, float, bool)):
+                                            st.write(f"  • {key}: `{value}`")
+                            
+                            # Raw metadata (collapsible)
+                            st.write("**🔍 Raw Metadata (JSON):**")
+                            st.code(json.dumps(metadata, indent=2, default=str), language="json")
+                            if "tools_used" in metadata:
+                                st.write(f"**Tools Used:** {metadata['tools_used']}")
                         if "tool_used" in metadata:
                             st.write(f"**Tool Used:** {metadata['tool_used']}")
                     with col2:
@@ -234,10 +481,45 @@ def main():
         if health_status["backend"]:
             tools = get_user_tools(user_role, st.session_state.doctor_id if user_role == "doctor" else None)
             if tools:
-                with st.expander(f"🛠️ Available Tools ({len(tools)})"):
-                    for tool in tools:
-                        st.write(f"• **{tool['name']}**")
-                        st.caption(tool.get('description', 'No description'))
+                st.subheader(f"🛠️ Available Tools ({len(tools)})")
+                for tool in tools:
+                    st.write(f"• **{tool['name']}**")
+                    st.caption(tool.get('description', 'No description'))
+        
+        st.divider()
+        
+        # Diagnostics Controls
+        st.header("🔍 Diagnostics & MCP")
+        
+        # Toggle for diagnostics
+        diagnostics_enabled = st.checkbox(
+            "Enable Response Diagnostics",
+            value=st.session_state.get("diagnostics_enabled", True),
+            help="Show detailed processing flow, MCP context, and SQL queries for each response"
+        )
+        st.session_state.diagnostics_enabled = diagnostics_enabled
+        
+        if diagnostics_enabled:
+            st.success("✅ Diagnostics Enabled")
+            st.caption("Response details will show: Processing flow, MCP context memory, SQL queries, and technical metadata")
+        else:
+            st.info("ℹ️ Diagnostics Disabled")
+        
+        # MCP System Summary
+        if health_status["mcp"]:
+            st.subheader("🧠 MCP System Summary")
+            mcp_summary = get_mcp_summary()
+            if "error" not in mcp_summary:
+                if "active_sessions" in mcp_summary:
+                    st.metric("Active Sessions", mcp_summary["active_sessions"])
+                if "total_context_items" in mcp_summary:
+                    st.metric("Total Context Items", mcp_summary["total_context_items"])
+                if "context_types" in mcp_summary:
+                    st.write("**Context Types Distribution:**")
+                    for ctx_type, count in mcp_summary["context_types"].items():
+                        st.write(f"  • {ctx_type}: {count}")
+            else:
+                st.error(f"MCP Summary Error: {mcp_summary.get('error', 'Unknown')}")
         
         st.divider()
         
@@ -252,6 +534,25 @@ def main():
                 "When is my earliest available slot?",
                 "Show me my schedule for tomorrow"
             ]
+            
+            # Add multi-turn conversation examples
+            st.write("**🔄 Multi-Turn Conversation Examples:**")
+            st.write("Try these sequences to see MCP context in action:")
+            
+            st.write("**💬 Example 1: Reference Resolution**")
+            st.write("1. 'Who is my next patient?'")
+            st.write("2. 'What's her medical history?' ← MCP resolves 'her'")
+            st.write("3. 'Reschedule that appointment' ← MCP resolves 'that appointment'")
+            
+            st.write("**💬 Example 2: Context Building**")
+            st.write("1. 'Show me my schedule for today'")
+            st.write("2. 'Who's at 2 PM?' ← Uses schedule context")
+            st.write("3. 'Move him to tomorrow' ← Resolves patient reference")
+                
+            st.write("**💬 Example 3: Date Context**")
+            st.write("1. 'What appointments do I have tomorrow?'")
+            st.write("2. 'Who is my first patient?' ← Uses tomorrow's context")
+            st.write("3. 'How long is that appointment?' ← References first patient")
         else:
             sample_queries = [
                 "Show me Dr. Smith's schedule",
@@ -326,10 +627,20 @@ def main():
         # Add assistant response to chat
         assistant_response = response_data.get("response", "Sorry, I couldn't process your request.")
         response_timestamp = datetime.now().strftime("%H:%M:%S")
-        response_metadata = response_data.get("metadata", {})
         
-        # Add role info to metadata for display
-        response_metadata["user_role"] = response_data.get("user_role", user_role)
+        # Collect comprehensive metadata for diagnostics
+        response_metadata = {
+            "original_query": user_input,
+            "session_id": response_data.get("session_id", "unknown"),
+            "tool_name": response_data.get("tool_name", "unknown"),
+            "intent": response_data.get("metadata", {}).get("intent", "unknown"),
+            "conversation_context": response_data.get("conversation_context", {}),
+            "sql_metadata": response_data.get("sql_metadata", {}),
+            "identity_context": response_data.get("identity_context", {}),
+            "user_role": response_data.get("user_role", user_role),
+            "response_success": response_data.get("success", True),
+            "backend_metadata": response_data.get("metadata", {})
+        }
         
         st.session_state.messages.append({
             "role": "assistant",
