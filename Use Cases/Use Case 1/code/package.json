@@ -12,6 +12,9 @@
     "start-ui": "streamlit run streamlit_app.py --server.port 8504 --server.address 127.0.0.1",
     "start-full": "concurrently --raw -n LANGGRAPH,MCP,UI -c cyan,yellow,magenta \"cd src && python api/langgraph_server.py\" \"cd src && python api/mcp_server.py\" \"streamlit run streamlit_app.py --server.port 8504\"",
     "start-legacy": "cd legacy && python streamlit_app.py",
+    "api": "python -m uvicorn src.api.langgraph_server:app --host 0.0.0.0 --port 8502 --reload",
+    "api-public": "echo 'Run: npm run api (in Terminal 1) then: ngrok http 8502 (in Terminal 2)'",
+    "ngrok": "ngrok http 8502",
     "test": "echo \"No tests specified yet\" && exit 0"
   },
   "keywords": ["medical", "appointment", "agent", "langgraph", "mcp", "ai"],
