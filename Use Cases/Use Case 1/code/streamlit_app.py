@@ -23,7 +23,9 @@ def get_doctor_mappings():
     """Get doctor ID to name mappings from the database."""
     try:
         import sqlite3
-        conn = sqlite3.connect('code/src/db/output.db')
+        import os
+        db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'src', 'db', 'output.db'))
+        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
         # Get distinct doctor mappings, prioritizing by recent appointments
@@ -246,40 +248,44 @@ def render_chat_message(role: str, content: str, timestamp: str = None, metadata
                     
                     with tab2:
                         st.subheader("🧠 MCP Context Memory")
-                        
                         # Get MCP context for this session
                         session_id = metadata.get("session_id", "streamlit_doctor_1")
                         mcp_data = get_mcp_context(session_id)
-                        
+                        # Always show raw MCP context JSON for debugging
+                        st.write("**Raw MCP Context (JSON):**")
+                        st.code(json.dumps(mcp_data, indent=2, default=str), language="json")
                         if "error" not in mcp_data:
-                            context = mcp_data.get("context", {})
-                            
-                            if context:
-                                # Show context summary
+                            # Prefer 'mcp_context' if present, else fallback to 'context' for backward compatibility
+                            context_items = mcp_data.get("mcp_context")
+                            if context_items is None:
+                                context_items = mcp_data.get("context", {})
+                                # If context is a dict, convert to list of items for uniformity
+                                if isinstance(context_items, dict):
+                                    context_items = list(context_items.values())
+                            if context_items:
                                 col1, col2 = st.columns(2)
                                 with col1:
-                                    st.metric("Context Items", len(context))
-                                    
+                                    st.metric("Context Items", len(context_items))
                                     # Show context types
                                     context_types = {}
-                                    for item in context.values():
+                                    for item in context_items:
                                         item_type = item.get("context_type", "unknown")
                                         context_types[item_type] = context_types.get(item_type, 0) + 1
-                                    
                                     st.write("**Context Types:**")
                                     for ctx_type, count in context_types.items():
                                         st.write(f"  • {ctx_type}: {count}")
-                                
                                 with col2:
-                                    # Show recent context items (limit to 5 most recent)
-                                    st.write("**Recent Context (Last 5):**")
+                                    # Show recent context items (limit to 5 most recent, sorted by queried_at if present)
+                                    def get_queried_at(item):
+                                        val = item.get("queried_at", "")
+                                        return val or ""
                                     sorted_items = sorted(
-                                        context.items(), 
-                                        key=lambda x: x[1].get("queried_at", ""), 
+                                        enumerate(context_items),
+                                        key=lambda x: get_queried_at(x[1]),
                                         reverse=True
                                     )[:5]
-                                    
-                                    for key, item in sorted_items:
+                                    st.write("**Recent Context (Last 5):**")
+                                    for idx, item in sorted_items:
                                         item_type = item.get("context_type", "unknown")
                                         timestamp_str = item.get("queried_at", "")
                                         if timestamp_str:
@@ -290,18 +296,14 @@ def render_chat_message(role: str, content: str, timestamp: str = None, metadata
                                                 time_display = timestamp_str
                                         else:
                                             time_display = "unknown"
-                                        
                                         st.write(f"  • **{item_type}** ({time_display})")
                                         if item_type == "schedule" and "schedule_data" in item:
                                             patient_count = len(item["schedule_data"])
                                             st.write(f"    └── {patient_count} appointments")
-                                
                                 # Detailed context view
                                 st.write("**📋 Detailed Context Data:**")
-                                
-                                for i, (key, item) in enumerate(sorted_items):
-                                    st.write(f"**Context {i+1}: {key} ({item.get('context_type', 'unknown')})**")
-                                    
+                                for i, item in enumerate([x[1] for x in sorted_items]):
+                                    st.write(f"**Context {i+1}: {item.get('context_type', 'unknown')}**")
                                     # Show context item details
                                     if item.get("context_type") == "schedule" and "schedule_data" in item:
                                         schedule_data = item["schedule_data"]
@@ -322,7 +324,6 @@ def render_chat_message(role: str, content: str, timestamp: str = None, metadata
                                     else:
                                         # Show raw context data in a code block
                                         st.code(json.dumps(item, indent=2, default=str), language="json")
-                                    
                                     st.write("")  # Add spacing between items
                             else:
                                 st.info("No MCP context available for this session")
