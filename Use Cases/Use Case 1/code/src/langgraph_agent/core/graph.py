@@ -10,15 +10,17 @@ from typing import Dict, Any, List
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage
 
-from .state import AgentState, create_initial_state
-from .config import AgentConfig
+from .base import AgentState, AgentConfig
+from .state import create_initial_state
 from ..nodes.processing import (
     context_resolver_node,
     tool_selector_node,
     sql_generator_node,
     response_formatter_node,
-    memory_manager_node
+    memory_manager_node,
+    slot_validator_node
 )
+from ..nodes.multi_step_planner import multi_step_planner_node
 
 logger = logging.getLogger(__name__)
 
@@ -51,22 +53,48 @@ def create_medical_agent_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
     
     # Add nodes with config binding
+
     workflow.add_node("context_resolver", lambda state: context_resolver_node(state, config))
     workflow.add_node("tool_selector", lambda state: tool_selector_node(state, config))
+    workflow.add_node("multi_step_planner", lambda state: multi_step_planner_node(state, config))
+    workflow.add_node("slot_validator", lambda state: slot_validator_node(state, config))
+    # Add backend_lookup_node if missing
+    from ..nodes.processing import backend_lookup_node
+    workflow.add_node("backend_lookup_node", lambda state: backend_lookup_node(state, config))
     workflow.add_node("sql_generator", lambda state: sql_generator_node(state, config))
     workflow.add_node("response_formatter", lambda state: response_formatter_node(state, config))
     workflow.add_node("memory_manager", lambda state: memory_manager_node(state, config))
-    
+
     # Set entry point
     workflow.set_entry_point("context_resolver")
-    
+
     # Define the flow
     workflow.add_edge("context_resolver", "tool_selector")
-    workflow.add_edge("tool_selector", "sql_generator")
+    workflow.add_edge("tool_selector", "multi_step_planner")
+    workflow.add_edge("multi_step_planner", "slot_validator")
+    # Replace slot_routing with direct conditional routing from slot_validator
+    def route_from_slot_validator(state):
+        # If all required fields are present, go to sql_generator
+        if state.get("slot_validation", {}).get("status") == "ok":
+            return "sql_generator"
+        # If missing natural fields, go to multi_step_planner
+        if state.get("slot_validation", {}).get("status") == "missing":
+            return "multi_step_planner"
+        # If missing backend fields, go to backend_lookup_node
+        if state.get("slot_validation", {}).get("status") == "missing_backend":
+            return "backend_lookup_node"
+        # Fallback: go to multi_step_planner
+        return "multi_step_planner"
+
+    workflow.add_conditional_edges("slot_validator", {
+        "sql_generator": lambda state: route_from_slot_validator(state) == "sql_generator",
+        "multi_step_planner": lambda state: route_from_slot_validator(state) == "multi_step_planner",
+        "backend_lookup_node": lambda state: route_from_slot_validator(state) == "backend_lookup_node"
+    })
     workflow.add_edge("sql_generator", "response_formatter")
     workflow.add_edge("response_formatter", "memory_manager")
     workflow.add_edge("memory_manager", END)
-    
+
     # Compile the graph
     return workflow.compile()
 
@@ -137,13 +165,17 @@ class MedicalAssistantAgent:
             
             # Update session state
             self.sessions[session_id] = result
-            
+
+            # Ensure clarification_prompt is copied into formatted_response if present and formatted_response is empty
+            if "clarification_prompt" in result and not result.get("formatted_response"):
+                result["formatted_response"] = result["clarification_prompt"]
+
             # Debug logging
             logger.info(f"Graph result - formatted_response: '{result['formatted_response']}'")
             logger.info(f"Graph result - has_errors: {result['has_errors']}")
             logger.info(f"Graph result keys: {list(result.keys())}")
             logger.info(f"Graph result sql_metadata: {result.get('sql_metadata', 'NOT_FOUND')}")
-            
+
             # Return processed result
             return {
                 "success": not result["has_errors"],
@@ -170,15 +202,28 @@ class MedicalAssistantAgent:
             }
     
     def get_session_context(self, session_id: str) -> Dict[str, Any]:
-        """Get current context for a session."""
+        """Get current context for a session, including all MCP context fields for diagnostics."""
         if session_id in self.sessions:
             state = self.sessions[session_id]
-            return {
+            # Gather all relevant context fields for diagnostics
+            context = {
                 "patient_context": state.get("patient_context"),
                 "doctor_context": state.get("doctor_context"),
-                "conversation_memory": state["conversation_memory"],
-                "message_count": len(state["messages"])
+                "conversation_memory": state.get("conversation_memory", {}),
+                "message_count": len(state.get("messages", [])),
+                "recent_queries": state.get("recent_queries", []),
+                "resolved_references": state.get("resolved_references", {}),
+                "query_intent": state.get("query_intent"),
+                "identity_context": state.get("identity_context"),
+                "selected_tool": state.get("selected_tool"),
+                "sql_metadata": state.get("sql_metadata", {}),
+                "tool_results": state.get("tool_results"),
+                "errors": state.get("errors", []),
+                "has_errors": state.get("has_errors", False),
+                "response_metadata": state.get("response_metadata", {}),
             }
+            # Optionally include any other custom MCP context fields here
+            return context
         return {}
     
     def clear_session(self, session_id: str):
