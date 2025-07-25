@@ -1,10 +1,239 @@
-"""
-Multi-Turn Medical Assistant Processing Nodes
+# Core agent types
+from langgraph_agent.core.base import AgentState, AgentConfig
+# LangChain message types
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+# Standard libraries
+import json
+import logging
+import re
+from typing import Dict, Any
+from datetime import datetime, timedelta
+# Agent state/context utilities
+from langgraph_agent.core.state import update_patient_context, add_to_conversation_memory
+# Database and MCP context manager tools
+from langgraph_agent.tools.database import (
+    execute_query, resolve_doctor_uuid_to_id, resolve_doctor_name_from_uuid,
+    get_next_appointment, get_patient_history, get_doctor_schedule
+)
+from langgraph_agent.tools.mcp_context_manager import mcp_context_manager
+# =========================
+# LangGraph Medical Agent Nodes
+# =========================
+# This file contains core agent logic for dynamic slot-filling, LLM-driven reasoning,
+# SQL generation, and context-aware user prompting. All logic is designed to be schema-agnostic
+# and robust for production use. Do not remove or rewrite core functions unless absolutely necessary.
+# =========================
+# --- SQL Generator Node ---
+def sql_generator_node(state: AgentState, config: AgentConfig) -> AgentState:
+    """
+    Generates SQL query using LLM and executes it, logging all relevant metadata.
+    """
+    logger.info("SQL generator node invoked")
+    generation_context = {
+        "tool_parameters": state.get("tool_parameters", {}),
+        "resolved_references": state.get("resolved_references", {}),
+        "query_intent": state.get("query_intent"),
+        "user_role": state.get("user_role"),
+        "doctor_id": state.get("doctor_id"),
+        "patient_context": state.get("patient_context"),
+        "current_query": state.get("current_query"),
+        "current_datetime": datetime.now().isoformat(),
+    }
+    doctor_uuid = state.get("doctor_uuid")
+    doctor_id_mapped = state.get("doctor_id")
+    system_prompt = "You are a helpful medical assistant."
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"Generate an SQL query for the following context: {json.dumps(generation_context, indent=2, default=str)}")
+    ]
+    response = config.llm.invoke(messages)
+    logger.info(f"OpenAI response content: '{response.content}'")
+    if not response.content or response.content.strip() == "":
+        logger.error("Empty response from OpenAI")
+        raise ValueError("Empty response from OpenAI")
+    try:
+        result = safe_json_parse(response.content, "SQL generator")
+    except Exception as je:
+        logger.error(f"JSON decode error: {je}")
+        content = response.content.strip()
+        if "SELECT" in content.upper():
+            lines = content.split('\n')
+            sql_line = None
+            for line in lines:
+                if "SELECT" in line.upper():
+                    sql_line = line.strip()
+                    break
+            if sql_line:
+                logger.info(f"Extracted SQL from non-JSON response: {sql_line}")
+                result = {
+                    "sql_query": sql_line,
+                    "query_parameters": [],
+                    "reasoning": "Extracted from non-JSON response",
+                    "query_type": "extracted"
+                }
+            else:
+                raise je
+        else:
+            raise je
+    state["sql_query"] = result.get("sql_query")
+    query_params = result.get("query_parameters", [])
+    query_type = result.get("query_type", "unknown")
+    reasoning = result.get("reasoning", "No reasoning provided")
+    if result.get("success"):
+        if result.get("results"):
+            state["tool_results"] = result["results"]
+        else:
+            state["tool_results"] = [{"rowcount": result.get("rowcount", 0), "success": True}]
+    else:
+        state["tool_results"] = []
+        state.setdefault("errors", []).append(f"Appointment query executor error: {result.get('error')}")
+        state["has_errors"] = True
+    print("=" * 80)
+    print("🗄️  LLM-GENERATED SQL EVALUATION - LangGraph Medical Agent")
+    print("=" * 80)
+    print(f"📊 Tool: {state.get('selected_tool', 'unknown')}")
+    print(f"🎯 Query Intent: {state.get('query_intent', 'unknown')}")
+    print(f"🔐 User Role: {state.get('user_role', 'unknown')}")
+    print(f"👤 Doctor ID: {state.get('doctor_id', 'N/A')} -> {doctor_id_mapped}")
+    print(f"🆔 Session: {state.get('session_id', 'N/A')}")
+    print(f"📝 Original Query: {state.get('current_query', 'N/A')}")
+    print(f"🧠 LLM Reasoning: {reasoning}")
+    print(f"Query Type: {query_type}")
+    print(f"🗄️  Generated SQL: {state['sql_query']}")
+    print(f"📊 Parameters: {query_params}")
+    print(f"📈 Result Count: {len(state['tool_results']) if state['tool_results'] else 0} rows")
+    print(f"🎯 Context References: {state.get('resolved_references', {})}")
+    print(f"⏰ Timestamp: {datetime.now().isoformat()}")
+    print("=" * 80)
+    # Log SQL metadata (fixed indentation and block structure)
+    state.setdefault("sql_metadata", {})["query_info"] = {
+        "original_params": query_params,
+        "mapped_params": query_params,
+        "doctor_uuid_mapping": f"{doctor_uuid} -> {doctor_id_mapped}" if doctor_uuid and doctor_id_mapped else None,
+        "result_count": len(state["tool_results"]) if state["tool_results"] else 0,
+        "generated_at": datetime.now().isoformat(),
+        "tool_name": state.get("selected_tool", "unknown"),
+        "query_type": query_type,
+        "llm_reasoning": reasoning,
+        "execution_method": "llm_generated_sql",
+        "user_context": {
+            "role": state.get("user_role", "unknown"),
+            "doctor_id": state.get("doctor_id"),
+            "session_id": state.get("session_id")
+        },
+        "query_intent": state["query_intent"],
+        "original_query": state["current_query"],
+        "tool_results": state["tool_results"],
+        "user_role": state["user_role"],
+        "patient_context": state.get("patient_context"),
+    }
+    return state
 
-This module contains the core processing nodes for the LangGraph medical assistant
-that handles context resolution, tool selection, SQL generation, and response formatting
-with enhanced MCP (Model Context Protocol) integration for superior context preservation.
+# --- Response Formatter Node ---
+def response_formatter_node(state: AgentState, config: AgentConfig) -> AgentState:
+    """
+    Formats the final response using LLM, based on tool_results and confirmation context.
+    """
+    logger.info("Formatting response using LLM")
+    confirmation_context = {
+        "tool_results": state.get("tool_results", []),
+        "tool_parameters": state.get("tool_parameters", {}),
+        "query_intent": state.get("query_intent"),
+        "user_role": state.get("user_role"),
+        "doctor_id": state.get("doctor_id"),
+        "patient_context": state.get("patient_context"),
+        "resolved_references": state.get("resolved_references", {}),
+        "original_query": state.get("current_query"),
+    }
+    system_prompt = "You are a helpful medical assistant."
+    prompt = f"""
+Format a helpful, natural response based ONLY on the tool_results and confirmation_context. Include relevant context and suggest follow-up actions if appropriate.
+Respond in JSON format:
+{{
+    "formatted_response": "...",
+    "response_metadata": {{}},
+    "suggested_followups": []
+}}
 """
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=prompt)
+    ]
+    response = config.llm.invoke(messages)
+    try:
+        result = safe_json_parse(response.content, "response formatter")
+        logger.info(f"Parsed result: {result}")
+        state["formatted_response"] = result.get("formatted_response", "I processed your request successfully.")
+        state["response_metadata"] = result.get("response_metadata", {})
+        state["response_metadata"].update({
+            "intent": state["query_intent"],
+            "tool_used": state.get("selected_tool"),
+            "has_errors": state.get("has_errors", False),
+            "context_resolved": bool(state.get("resolved_references"))
+        })
+        logger.info("Response formatted successfully")
+    except Exception as e:
+        logger.error(f"Response formatting error: {e}")
+        state.setdefault("errors", []).append(f"Response formatting failed: {e}")
+        state["has_errors"] = True
+        if state.get("tool_results"):
+            state["formatted_response"] = f"I found {len(state['tool_results'])} results for your query."
+        else:
+            state["formatted_response"] = "I couldn't find any results for your query."
+    return state
+from langgraph_agent.core.base import AgentState, AgentConfig
+from langgraph_agent.core.base import AgentState, AgentConfig
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+
+# Only prompt for user-dependent fields; auto-resolve the rest
+USER_DEPENDENT_FIELDS = {"service_name", "patient_name", "start_time", "appointment_date"}
+AUTO_RESOLVE_FIELDS = {"service_id", "branch_name", "appointment_id", "status_id", "end_time"}
+def multi_step_planner_node(state: AgentState, config: AgentConfig) -> AgentState:
+    """
+    Multi-step planner for slot-filling. Uses LLM to reason about missing user-dependent fields and generate a user-facing prompt.
+    Only prompts for service name, patient name, and date/time. All other fields are auto-resolved by the agent.
+    """
+    tool_params = state.get("tool_parameters", {})
+    # Determine which user-dependent fields are missing (None, "unknown", or empty string)
+    missing_fields = [field for field in USER_DEPENDENT_FIELDS if tool_params.get(field) in [None, "unknown", ""]]
+    # Build context for LLM prompt
+    context = {
+        "patient_name": tool_params.get("patient_name"),
+        "doctor_id": tool_params.get("doctor_id"),
+        "service_name": tool_params.get("service_name"),
+        "appointment_time": tool_params.get("start_time"),
+        "appointment_date": tool_params.get("appointment_date"),
+        "intent": state.get("query_intent"),
+        "missing_fields": missing_fields,
+        "tool_parameters": tool_params,
+        "original_query": state.get("current_query"),
+        "resolved_references": state.get("resolved_references", {})
+    }
+    # Compose a context-aware prompt that only asks for missing fields, never repeating already filled fields
+    prompt = f"""
+You are a medical assistant agent helping to book an appointment. The following user-dependent fields are still missing: {missing_fields}.
+Here is the current context:
+{json.dumps(context, indent=2, default=str)}
+
+Generate a polite, context-aware message asking for ONLY the missing fields. If only one field is missing, ask for it directly. If multiple are missing, ask for all together. Never ask for fields that are already filled. Use available context (patient name, doctor, service, date, time) to make your question natural and specific. Respond in plain English, not JSON.
+"""
+    system_prompt = "You are a helpful medical assistant."
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=prompt)
+    ]
+    response = config.llm.invoke(messages)
+    # Use the LLM's output as the user-facing prompt
+    state["formatted_response"] = response.content.strip()
+    state["required_lookups"] = missing_fields
+    return state
+
+
+
+# Multi-Turn Medical Assistant Processing Nodes
+# This module contains the core processing nodes for the LangGraph medical assistant
+# that handles context resolution, tool selection, SQL generation, and response formatting
+# with enhanced MCP (Model Context Protocol) integration for superior context preservation.
 
 import json
 import logging
@@ -12,9 +241,8 @@ import re
 from typing import Dict, Any
 from datetime import datetime, timedelta
 
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langgraph_agent.core.config import AgentConfig
-from langgraph_agent.core.state import AgentState, update_patient_context, add_to_conversation_memory
+from langgraph_agent.core.base import AgentState, AgentConfig
+from langgraph_agent.core.state import update_patient_context, add_to_conversation_memory
 from langgraph_agent.tools.database import (
     execute_query, resolve_doctor_uuid_to_id, resolve_doctor_name_from_uuid,
     get_next_appointment, get_patient_history, get_doctor_schedule
@@ -29,14 +257,14 @@ def clean_json_response(response_content: str) -> str:
     Clean OpenAI response content to extract valid JSON.
     Handles responses wrapped in ```json code blocks and removes comments.
     """
-    # Remove code block markers
+    # Remove code block markers robustly
     content = response_content.strip()
     if content.startswith("```json"):
-        content = content[7:]  # Remove ```json
+        content = content[len("```json"):].strip()
     if content.startswith("```"):
-        content = content[3:]   # Remove ```
+        content = content[len("```"):].strip()
     if content.endswith("```"):
-        content = content[:-3]  # Remove closing ```
+        content = content[:-len("```")].strip()
     
     # Remove single-line comments (// comments)
     lines = content.split('\n')
@@ -45,10 +273,9 @@ def clean_json_response(response_content: str) -> str:
         # Remove // comments but preserve the rest of the line
         if '//' in line:
             comment_pos = line.find('//')
-            # Check if // is inside a string
             before_comment = line[:comment_pos]
             quote_count = before_comment.count('"') - before_comment.count('\\"')
-            if quote_count % 2 == 0:  # Even number of quotes means // is outside string
+            if quote_count % 2 == 0:
                 line = line[:comment_pos].rstrip()
         cleaned_lines.append(line)
     
@@ -124,26 +351,19 @@ def safe_json_parse(response_content: str, node_name: str) -> Dict[str, Any]:
 def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
     """
     Enhanced context resolver with MCP (Model Context Protocol) integration.
-    
     This node analyzes the current query against conversation memory and 
     existing context to resolve references like "next patient", "she", etc.
     Enhanced with MCP for standardized context management.
     """
     logger.info(f"Context resolver processing: {state['current_query']}")
-    
     session_id = state.get("session_id", "default_session")
-    
     # Preprocess date references before other processing
     date_mappings = preprocess_date_references(state["current_query"])
     logger.info(f"Date mappings found: {date_mappings}")
-    
     # First, try MCP context resolution for better reference handling
     mcp_resolved_refs = {}
     query_lower = state["current_query"].lower()
-    
-    # Common reference patterns
     reference_patterns = ["next patient", "her", "him", "that appointment", "this patient", "my schedule"]
-    
     for pattern in reference_patterns:
         if pattern in query_lower:
             resolved = mcp_context_manager.resolve_reference(
@@ -153,12 +373,20 @@ def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
             if resolved:
                 mcp_resolved_refs[pattern] = resolved
                 logger.info(f"MCP resolved '{pattern}' -> {resolved.get('patient_name', 'context')}")
-    
-    system_prompt = config.get_system_prompt("context_resolver")
-    
-    # Enhanced context information including MCP context and date mappings
+    # Refined system prompt: all rules and output schema in SystemMessage
+    system_prompt = """
+You are a medical assistant context resolver.
+- Resolve vague references (e.g. 'him', 'her', 'next patient') using MCP context, recent messages, and date mappings.
+- Respond with ONLY a valid JSON object (no markdown, no explanation, no preamble).
+- If any value cannot be resolved, set it to null.
+Output Schema:
+{
+  \"query_intent\": "...",
+  \"resolved_references\": { ... },
+  \"context_updates\": { ... }
+}
+""".strip()
     mcp_context_summary = mcp_context_manager.get_context_summary(session_id)
-    
     context_info = {
         "current_query": state["current_query"],
         "user_role": state["user_role"],
@@ -166,94 +394,54 @@ def context_resolver_node(state: AgentState, config: AgentConfig) -> AgentState:
         "patient_context": state.get("patient_context"),
         "doctor_context": state.get("doctor_context"),
         "conversation_memory": state["conversation_memory"],
-        "recent_messages": [msg.content for msg in state["messages"][-3:] if hasattr(msg, 'content')],
+        "recent_messages": [msg.content for msg in state["messages"][-5:] if hasattr(msg, 'content')],
         "mcp_context_summary": mcp_context_summary,
         "mcp_resolved_references": mcp_resolved_refs,
         "date_mappings": date_mappings,
         "current_date": datetime.now().strftime('%Y-%m-%d')
     }
-    
-    prompt = f"""
-{system_prompt}
-
-Current context (enhanced with MCP and date preprocessing):
-{json.dumps(context_info, indent=2, default=str)}
-
-IMPORTANT DATE AND TIME PROCESSING:
-- Current date: {datetime.now().strftime('%Y-%m-%d')}
-- Date mappings: {date_mappings}
-- When the query mentions "tomorrow", use date: {date_mappings.get('tomorrow', 'N/A')}
-- When the query mentions "today", use date: {date_mappings.get('today', 'N/A')}
-
-TIME-SPECIFIC QUERY DETECTION:
-- If query contains specific times (e.g., "2 PM", "10:30", "at 3", "9 AM"), classify as "time_specific_lookup"
-- If query asks about "next patient" or "who's next", classify as "next_patient"
-- If query asks about general schedule ("my appointments", "schedule today"), classify as "schedule"
-- Time patterns to detect: [time][AM/PM], [hour]:[minute], "at [time]", "who's at [time]"
-
-Analyze the query "{state['current_query']}" and provide:
-1. query_intent: Choose from (time_specific_lookup, next_patient, schedule, patient_history, availability)
-   - Use "time_specific_lookup" for queries with specific times like "Who's at 2 PM?"
-   - Use "next_patient" only for queries asking about the chronologically next patient
-   - Use "schedule" for general schedule viewing requests
-2. resolved_references: Dictionary mapping implicit references to explicit values (MUST include actual dates for temporal references)
-3. context_updates: Any updates needed to patient or doctor context
-4. reasoning: Explain why this intent was chosen and how time references were interpreted
-
-Use MCP-resolved references when available for better accuracy.
-Use the preprocessed date mappings for temporal references like "tomorrow", "today", etc.
-
-Respond in JSON format:
-{{
-    "query_intent": "...",
-    "resolved_references": {{}},
-    "context_updates": {{}},
-    "reasoning": "..."
-}}
-"""
-    
     try:
         messages = [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt)
+            HumanMessage(content=json.dumps(context_info, indent=2, default=str))
         ]
-        
         response = config.llm.invoke(messages)
-        
-        # Debug the response content
         logger.info(f"Context resolver OpenAI response content: '{response.content}'")
-        
         if not response.content or response.content.strip() == "":
             logger.error("Empty response from OpenAI in context resolver")
             raise ValueError("Empty response from OpenAI")
-        
         try:
             result = safe_json_parse(response.content, "context resolver")
         except Exception as je:
             logger.error(f"Context resolution error: {je}")
             # Use fallback logic if JSON parsing fails
             raise je
-        
         # Update state with resolved information
         state["query_intent"] = result.get("query_intent")
-        
-        # Merge date mappings, MCP-resolved references, and LLM-resolved references
+        # Booking-intent fallback heuristic (traceable override)
+        if state["query_intent"] == "time_specific_lookup":
+            booking_verbs = ["book", "schedule", "add", "make", "create", "set", "reserve"]
+            query_words = re.findall(r'\b\w+\b', state["current_query"].lower())
+            if any(verb in query_words for verb in booking_verbs):
+                # Preserve original intent for debugging/multi-intent
+                state["query_intent_original"] = state["query_intent"]
+                state["query_intent"] = "book_appointment"
+                logger.warning("Overriding intent: time_specific_lookup → book_appointment (based on verb match)")
+        # Final resolved references:
+        # - LLM output takes precedence
+        # - MCP fills gaps
+        # - Date mappings are injected into the same object
         llm_resolved = result.get("resolved_references", {})
-        final_resolved = {**date_mappings, **mcp_resolved_refs, **llm_resolved}
+        final_resolved = {**mcp_resolved_refs, **date_mappings, **llm_resolved}
         state["resolved_references"] = final_resolved
-        
-        # Apply context updates
         context_updates = result.get("context_updates", {})
         if context_updates.get("patient_context"):
             state = update_patient_context(state, **context_updates["patient_context"])
-        
         logger.info(f"Context resolved - Intent: {state['query_intent']}, References: {state['resolved_references']}")
-        
     except Exception as e:
         logger.error(f"Context resolution error: {e}")
         state["errors"].append(f"Context resolution failed: {e}")
         state["has_errors"] = True
-        # Fallback to basic intent detection
         query_lower = state["current_query"].lower()
         if any(word in query_lower for word in ["next", "upcoming"]):
             state["query_intent"] = "next_patient"
@@ -263,19 +451,13 @@ Respond in JSON format:
             state["query_intent"] = "schedule"
         else:
             state["query_intent"] = "general_query"
-        
-        # Use MCP-resolved references even if LLM fails
         if mcp_resolved_refs:
             state["resolved_references"] = mcp_resolved_refs
             logger.info(f"Using MCP fallback references: {mcp_resolved_refs}")
-    
     return state
 
 
 def tool_selector_node(state: AgentState, config: AgentConfig) -> AgentState:
-    """
-    Select the appropriate tool and parameters based on resolved context.
-    """
     logger.info(f"Tool selector processing intent: {state['query_intent']}")
     
     system_prompt = config.get_system_prompt("tool_selector")
@@ -360,313 +542,204 @@ Select the best tool and parameters. Respond in JSON format:
     return state
 
 
-def sql_generator_node(state: AgentState, config: AgentConfig) -> AgentState:
+def validate_sql_params(params: dict) -> str | list:
     """
-    Generate SQL query based on selected tool and parameters.
-    ALL queries are generated by LLM for proper evaluation of SQL generation accuracy.
+    Validate required SQL parameters. Returns 'ok' if all present, else list of missing user-dependent keys.
+    Auto-resolve fields are not considered missing for user prompt.
     """
-    logger.info(f"SQL generator processing tool: {state['selected_tool']}")
-    
-    system_prompt = config.get_system_prompt("sql_generator")
-    
-    # Map doctor UUID to integer DoctorId if needed
-    doctor_uuid = state.get("doctor_id")
-    doctor_id_mapped = None
-    if doctor_uuid:
-        # Check if doctor_id is already an integer (direct DoctorId)
-        try:
-            # If it's already an integer, use it directly
-            doctor_id_mapped = int(doctor_uuid)
-            logger.info(f"Doctor ID {doctor_uuid} is already an integer DoctorId: {doctor_id_mapped}")
-        except ValueError:
-            # If it's not an integer, try to resolve UUID to DoctorId
-            doctor_id_mapped = resolve_doctor_uuid_to_id(doctor_uuid)
-            logger.info(f"Mapped doctor UUID {doctor_uuid} to DoctorId {doctor_id_mapped}")
-    
-    generation_context = {
-        "selected_tool": state["selected_tool"],
-        "tool_parameters": state["tool_parameters"],
-        "resolved_references": state["resolved_references"],
-        "query_intent": state["query_intent"],
-        "original_query": state["current_query"],
-        "doctor_uuid": doctor_uuid,
-        "doctor_id_mapped": doctor_id_mapped,
-        "patient_context": state.get("patient_context"),
-        "current_date": datetime.now().strftime("%Y-%m-%d"),
-        "current_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "time_conversion_guide": {
-            "12_hour_to_24_hour": {
-                "12 AM": "00:00", "1 AM": "01:00", "2 AM": "02:00", "3 AM": "03:00",
-                "4 AM": "04:00", "5 AM": "05:00", "6 AM": "06:00", "7 AM": "07:00", 
-                "8 AM": "08:00", "9 AM": "09:00", "10 AM": "10:00", "11 AM": "11:00",
-                "12 PM": "12:00", "1 PM": "13:00", "2 PM": "14:00", "3 PM": "15:00",
-                "4 PM": "16:00", "5 PM": "17:00", "6 PM": "18:00", "7 PM": "19:00",
-                "8 PM": "20:00", "9 PM": "21:00", "10 PM": "22:00", "11 PM": "23:00"
-            },
-            "time_patterns": ["at", "PM", "AM", ":", "o'clock", "sharp", "exactly"]
-        },
-        "resolved_time_references": state.get("resolved_references", {})
-    }
-    
-    prompt = f"""
-{system_prompt}
+    required_natural_fields = ["service_name", "patient_name", "appointment_date", "appointment_time"]
+    missing = [field for field in required_natural_fields if not params.get(field)]
+    return "ok" if not missing else missing
 
-CRITICAL: Generate SQL queries for ALL requests. Do NOT use hardcoded functions.
+def slot_validator_node(state: AgentState, config: AgentConfig) -> AgentState:
+    """
+    Slot Validator Node
+    ------------------
+    Validates required parameters before SQL execution. Prompts ONLY for natural fields (service name, patient name, date/time).
+    All IDs and backend fields are resolved internally (set as None for now, with comments for future DB lookups).
+    Logs backend field resolution in response_metadata and mcp_context.
+    """
 
-DATABASE SCHEMA INFORMATION:
-- View_Appointments table: AppointmentId, PatientId, PatientName, DoctorId, DoctorName, BranchId, BranchName, CategoryId, CategoryName, ServiceId, ServiceName, MachineId, MachineName, StartDateTime, EndDateTime, StatusId, Status
-- COR_Doctor table: UserId (UUID), SpecialtyId, FirstName, LastName, DisplayName, Phone, Email, DefaultBranchId, IsActive
-- Current DateTime: {generation_context['current_datetime']}
-- Doctor UUID {doctor_uuid} maps to DoctorId {doctor_id_mapped}
+    logger.info(f"Slot validator checking parameters for tool: {state.get('selected_tool')}")
+    params = state.get("tool_parameters", {})
+    resolved = {**params, **state.get("resolved_references", {})}
 
-QUERY TYPE PATTERNS:
-1. NEXT_PATIENT: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND StartDateTime > datetime('now') ORDER BY StartDateTime ASC LIMIT 1"
-2. TIME_SPECIFIC_LOOKUP: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? AND strftime('%H:%M', StartDateTime) = ? ORDER BY StartDateTime"
-3. PATIENT_HISTORY: "SELECT * FROM View_Appointments WHERE PatientName LIKE ? OR PatientId = ? ORDER BY StartDateTime DESC"
-4. DOCTOR_SCHEDULE: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = ? ORDER BY StartDateTime"
-5. TODAY_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') ORDER BY StartDateTime"
-6. TOMORROW_APPOINTMENTS: "SELECT * FROM View_Appointments WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now', '+1 day') ORDER BY StartDateTime"
-
-TIME-SPECIFIC QUERY HANDLING:
-- For queries like "Who's at 2 PM?", use TIME_SPECIFIC_LOOKUP pattern
-- Convert time references: "2 PM" → "14:00", "9 AM" → "09:00", "10:30" → "10:30"
-- Time-specific queries should filter by BOTH date AND time
-- Example: "Who's at 2 PM today?" → WHERE DoctorId = ? AND DATE(StartDateTime) = DATE('now') AND strftime('%H:%M', StartDateTime) = '14:00'
-
-IMPORTANT MAPPINGS:
-- Use DoctorId {doctor_id_mapped} for doctor queries (NOT the UUID)
-- For date references, use the resolved dates from context: {generation_context.get('resolved_references', {})}
-- Patient references should use LIKE '%name%' for partial matching
-- Time references should be converted to 24-hour format (HH:MM)
-
-Generation context:
-{json.dumps(generation_context, indent=2, default=str)}
-
-Based on the query intent "{state['query_intent']}" and original query "{state['current_query']}", generate the appropriate SQL query.
-
-Respond in JSON format:
-{{
-    "sql_query": "SELECT ...",
-    "query_parameters": [],
-    "reasoning": "Explanation of why this query matches the intent and handles the user's request",
-    "query_type": "next_patient|patient_history|schedule|general"
-}}
-"""
-    
-    try:
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt)
-        ]
-        
-        response = config.llm.invoke(messages)
-        
-        # Debug the response content
-        logger.info(f"OpenAI response content: '{response.content}'")
-        
-        if not response.content or response.content.strip() == "":
-            logger.error("Empty response from OpenAI")
-            raise ValueError("Empty response from OpenAI")
-        
-        try:
-            result = safe_json_parse(response.content, "SQL generator")
-        except Exception as je:
-            logger.error(f"JSON decode error: {je}")
-            # Try to extract SQL from non-JSON response
-            content = response.content.strip()
-            if "SELECT" in content.upper():
-                # Extract SQL query from the response
-                lines = content.split('\n')
-                sql_line = None
-                for line in lines:
-                    if "SELECT" in line.upper():
-                        sql_line = line.strip()
-                        break
-                if sql_line:
-                    logger.info(f"Extracted SQL from non-JSON response: {sql_line}")
-                    result = {
-                        "sql_query": sql_line, 
-                        "query_parameters": [],
-                        "reasoning": "Extracted from non-JSON response",
-                        "query_type": "extracted"
-                    }
-                else:
-                    raise je
-            else:
-                raise je
-        
-        state["sql_query"] = result.get("sql_query")
-        query_params = result.get("query_parameters", [])
-        query_type = result.get("query_type", "unknown")
-        reasoning = result.get("reasoning", "No reasoning provided")
-        
-        # Replace doctor UUID with mapped integer DoctorId in parameters
-        final_params = []
-        for param in query_params:
-            if param == doctor_uuid and doctor_id_mapped is not None:
-                final_params.append(doctor_id_mapped)
-            else:
-                final_params.append(param)
-        
-        # Execute the query and add observability metadata
-        state["tool_results"] = execute_query(state["sql_query"], tuple(final_params))
-        
-        # Enhanced SQL logging for observability (to stdout)
-        print("=" * 80)
-        print("🗄️  LLM-GENERATED SQL EVALUATION - LangGraph Medical Agent")
-        print("=" * 80)
-        print(f"📊 Tool: {state.get('selected_tool', 'unknown')}")
-        print(f"🎯 Query Intent: {state.get('query_intent', 'unknown')}")
-        print(f"🔐 User Role: {state.get('user_role', 'unknown')}")
-        print(f"👤 Doctor ID: {state.get('doctor_id', 'N/A')} -> {doctor_id_mapped}")
-        print(f"🆔 Session: {state.get('session_id', 'N/A')}")
-        print(f"📝 Original Query: {state.get('current_query', 'N/A')}")
-        print(f"🧠 LLM Reasoning: {reasoning}")
-        print(f"� Query Type: {query_type}")
-        print(f"�🗄️  Generated SQL: {state['sql_query']}")
-        print(f"📊 Parameters: {final_params}")
-        print(f"📈 Result Count: {len(state['tool_results']) if state['tool_results'] else 0} rows")
-        print(f"🎯 Context References: {state.get('resolved_references', {})}")
-        print(f"⏰ Timestamp: {datetime.now().isoformat()}")
-        print("=" * 80)
-        
-        # Add SQL metadata to state for response inclusion
-        state["sql_metadata"] = {
-            "raw_query": state["sql_query"],
-            "parameters": final_params,
-            "parameter_mapping": {
-                "original_params": query_params,
-                "mapped_params": final_params,
-                "doctor_uuid_mapping": f"{doctor_uuid} -> {doctor_id_mapped}" if doctor_uuid and doctor_id_mapped else None
-            },
-            "result_count": len(state["tool_results"]) if state["tool_results"] else 0,
-            "generated_at": datetime.now().isoformat(),
-            "tool_name": state.get("selected_tool", "unknown"),
-            "query_type": query_type,
-            "llm_reasoning": reasoning,
-            "execution_method": "llm_generated_sql",
-            "user_context": {
-                "role": state.get("user_role", "unknown"),
-                "doctor_id": state.get("doctor_id"),
-                "session_id": state.get("session_id")
-            },
-            "query_evaluation": {
-                "intent": state["query_intent"],
-                "original_query": state["current_query"],
-                "resolved_references": state["resolved_references"],
-                "context_used": bool(state.get("patient_context") or state.get("doctor_context"))
-            }
+    # Use LLM to determine required fields, missing fields, and parse natural language dates
+    system_prompt = (
+        "You are a medical assistant agent."
+        " Given the current tool, parameters, and context, do the following:"
+        " 1. Parse any natural language dates/times (e.g., 'next Monday', 'tomorrow') and fill them in as ISO date/time if possible."
+        " 2. Determine which fields are required for the current tool (do NOT include backend fields like service_id, patient_id, etc.)."
+        " 3. Identify which required fields are missing."
+        " 4. If any required fields are missing, generate a natural prompt asking ONLY for those fields, using available context."
+        " Respond in JSON with:"
+        " {"
+        "   'parsed_parameters': { ... },"
+        "   'required_fields': [ ... ],"
+        "   'missing_fields': [ ... ],"
+        "   'clarification_prompt': '...'"
+        " }"
+        " Do NOT ask about backend fields. Only prompt for user-facing fields relevant to the tool."
+    )
+    llm_input = {
+        "tool": state.get("selected_tool"),
+        "parameters": resolved,
+        "context": {
+            "query_intent": state.get("query_intent"),
+            "resolved_references": state.get("resolved_references", {}),
+            "patient_context": state.get("patient_context"),
+            "doctor_context": state.get("doctor_context"),
+            "conversation_memory": state.get("conversation_memory"),
         }
-        
-        logger.info(f"SQL executed: {state['sql_query']}, Params: {final_params}, Results: {len(state['tool_results']) if state['tool_results'] else 0} rows")
-        
-    except Exception as e:
-        logger.error(f"SQL generation/execution error: {e}")
-        state["errors"].append(f"SQL execution failed: {e}")
-        state["has_errors"] = True
-        state["tool_results"] = []
-    
-    return state
-
-
-def response_formatter_node(state: AgentState, config: AgentConfig) -> AgentState:
-    """
-    Format the tool results into a natural language response.
-    """
-    logger.info("Response formatter processing results")
-    
-    system_prompt = config.get_system_prompt("response_formatter")
-    
-    # Resolve doctor names in results if needed
-    results = state["tool_results"]
-    if results and isinstance(results, list):
-        for result in results:
-            if isinstance(result, dict) and "DoctorID" in result and result["DoctorID"]:
-                doctor_name = resolve_doctor_name_from_uuid(result["DoctorID"])
-                if doctor_name:
-                    result["DoctorName"] = doctor_name
-    
-    formatting_context = {
-        "query_intent": state["query_intent"],
-        "original_query": state["current_query"],
-        "tool_results": results,
-        "user_role": state["user_role"],
-        "patient_context": state.get("patient_context"),
-        "resolved_references": state["resolved_references"],
-        "conversation_flow": state["conversation_memory"]["conversation_flow"]
     }
-    
-    prompt = f"""
-{system_prompt}
-
-Formatting context:
-{json.dumps(formatting_context, indent=2, default=str)}
-
-CRITICAL INSTRUCTION: 
-- When formatting a response for a specific date query (like "tomorrow" or "today"), ONLY use the tool_results data.
-- Do NOT mix cached context data with current query results.
-- The tool_results contain the EXACT data requested for the specific query.
-- Original query: "{state['current_query']}"
-- Query intent: {state['query_intent']}
-- Resolved date references: {state.get('resolved_references', {}).get('tomorrow', 'N/A')} / {state.get('resolved_references', {}).get('today', 'N/A')}
-
-Format a helpful, natural response based ONLY on the tool_results. Include relevant context and suggest follow-up actions if appropriate.
-Respond in JSON format:
-{{
-    "formatted_response": "...",
-    "response_metadata": {{}},
-    "suggested_followups": []
-}}
-"""
-    
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=json.dumps(llm_input, default=str))
+    ]
+    response = config.llm.invoke(messages)
     try:
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt)
-        ]
-        
-        response = config.llm.invoke(messages)
-        logger.info(f"Response formatter LLM output: {response.content}")
-        result = safe_json_parse(response.content, "response formatter")
-        logger.info(f"Parsed result: {result}")
-        
-        state["formatted_response"] = result.get("formatted_response", "I processed your request successfully.")
-        state["response_metadata"] = result.get("response_metadata", {})
-        
-        # Add processing metadata
-        state["response_metadata"].update({
-            "intent": state["query_intent"],
-            "tool_used": state["selected_tool"],
-            "has_errors": state["has_errors"],
-            "context_resolved": bool(state["resolved_references"])
-        })
-        
-        logger.info("Response formatted successfully")
-        
+        result = safe_json_parse(response.content, "slot validator")
     except Exception as e:
-        logger.error(f"Response formatting error: {e}")
-        state["errors"].append(f"Response formatting failed: {e}")
-        state["has_errors"] = True
-        # Fallback response
-        if state["tool_results"]:
-            state["formatted_response"] = f"I found {len(state['tool_results'])} results for your query."
-        else:
-            state["formatted_response"] = "I couldn't find any results for your query."
-    
-    return state
+        logger.error(f"Slot validator LLM response parse error: {e}")
+        result = {
+            "parsed_parameters": params,
+            "required_fields": [],
+            "missing_fields": [],
+            "clarification_prompt": "Sorry, I couldn't parse the required fields."
+        }
 
+
+    # Update parameters with LLM-parsed values
+    state["tool_parameters"] = result.get("parsed_parameters", params)
+    all_missing = result.get("missing_fields", [])
+    # Define backend/internal fields (never prompt user for these)
+    backend_fields = {"patient_id", "service_id", "branch_name", "status_id", "appointment_id", "end_time"}
+    # Separate missing fields into backend and natural
+    missing_backend = [f for f in all_missing if f in backend_fields]
+    missing_natural = [f for f in all_missing if f not in backend_fields]
+
+
+    # Routing logic is now handled by graph condition functions, not by node state.
+    if missing_natural and missing_backend:
+        state["slot_validation"] = {"status": "missing", "fields": missing_natural}
+        state["required_lookups"] = missing_natural
+        state["clarification_prompt"] = result.get("clarification_prompt", "")
+        state["formatted_response"] = result.get("clarification_prompt", "")
+    elif missing_backend:
+        state["slot_validation"] = {"status": "missing_backend", "fields": missing_backend}
+        state["required_lookups"] = missing_backend
+        state["clarification_prompt"] = ""
+        state["formatted_response"] = ""
+    elif missing_natural:
+        state["slot_validation"] = {"status": "missing", "fields": missing_natural}
+        state["required_lookups"] = missing_natural
+        state["clarification_prompt"] = result.get("clarification_prompt", "")
+        state["formatted_response"] = result.get("clarification_prompt", "")
+    else:
+        state["slot_validation"] = {"status": "ok", "fields": []}
+        state["required_lookups"] = []
+        state["clarification_prompt"] = ""
+        state["formatted_response"] = ""
+    return state
+def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
+    """
+    Backend Lookup Node
+    ------------------
+    Resolves backend/internal fields (IDs, branch, status) using available context and lookup tools.
+    This node is never exposed to the user and does not prompt for input.
+    """
+    logger.info(f"Backend lookup node resolving: {state.get('required_lookups', [])}")
+    params = state.get("tool_parameters", {})
+    resolved = {**params, **state.get("resolved_references", {})}
+    lookups = state.get("required_lookups", [])
+
+    # Modularized backend field resolution
+    def resolve_backend_field(field, resolved, params):
+        if field == "patient_id" and resolved.get("patient_name"):
+            from langgraph_agent.tools.database import lookup_patient_id
+            patient_id = lookup_patient_id(resolved["patient_name"])
+            if patient_id:
+                params["patient_id"] = patient_id
+                return (field, patient_id)
+        elif field == "service_id" and resolved.get("service_name"):
+            from langgraph_agent.tools.database import get_service_id_and_duration
+            service_info = get_service_id_and_duration(resolved["service_name"])
+            if service_info and "service_id" in service_info:
+                params["service_id"] = service_info["service_id"]
+                if "duration" in service_info:
+                    params["duration"] = service_info["duration"]
+                return (field, service_info["service_id"])
+        elif field == "branch_name" and resolved.get("doctor_id"):
+            from langgraph_agent.tools.database import get_doctor_default_branch
+            branch = get_doctor_default_branch(resolved["doctor_id"])
+            if branch:
+                params["branch_name"] = branch
+                return (field, branch)
+        elif field == "status_id":
+            from langgraph_agent.tools.database import get_status_id
+            status_id = get_status_id("Booked")
+            if status_id:
+                params["status_id"] = status_id
+                return (field, status_id)
+        elif field == "appointment_id":
+            from langgraph_agent.tools.database import get_next_available_appointment_id
+            appointment_id = get_next_available_appointment_id()
+            if appointment_id:
+                params["appointment_id"] = appointment_id
+                return (field, appointment_id)
+        return (field, None)
+
+    # Track debug info for each lookup
+    debug_lookups = {}
+    for field in lookups:
+        key, value = resolve_backend_field(field, resolved, params)
+        debug_lookups[key] = value
+
+    # Update tool_parameters
+    state["tool_parameters"] = params
+    # After backend resolution, check if any backend fields are still missing
+    backend_fields = {"patient_id", "service_id", "branch_name", "status_id", "appointment_id", "end_time"}
+    still_missing = [f for f in backend_fields if not state["tool_parameters"].get(f)]
+    if still_missing:
+        logger.warning(f"Backend lookup could not resolve: {still_missing}")
+        state["slot_validation"] = {"status": "missing_backend", "fields": still_missing}
+        state["required_lookups"] = still_missing
+    else:
+        state["slot_validation"] = {"status": "ok", "fields": []}
+        state["required_lookups"] = []
+
+    # Add debug metadata for visibility
+    backend_logs = {
+        "tool": state.get("selected_tool"),
+        "resolved_lookups": debug_lookups,
+        "still_missing": still_missing,
+        "final_params": state["tool_parameters"]
+    }
+    state.setdefault("response_metadata", {})["backend_logs"] = backend_logs
+    state.setdefault("mcp_context", {})["backend_logs"] = backend_logs
+
+    logger.info(f"Backend lookup node result: params={state['tool_parameters']}, debug={backend_logs}")
+    return state
 
 def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
     """
+    Memory Manager Node
+    ------------------
+    Updates conversation memory and context for future reference using standardized MCP (Model Context Protocol).
+    This node is critical for context preservation and reference resolution.
+    """
+    # =========================
+    # Experimental / Under Development Blocks
+    # =========================
+    # If you see large commented-out or half-integrated blocks below, they are likely
+    # experimental, legacy, or under development. Do not remove unless confirmed dead code.
+    # =========================
+    # Enhanced memory manager with MCP context storage.
+    """
     Enhanced memory manager with MCP context storage.
-    
-    Updates conversation memory and context for future reference using
-    standardized MCP (Model Context Protocol) for better context preservation.
     """
     logger.info("Memory manager updating conversation state with MCP integration")
-    
     session_id = state.get("session_id", "default_session")
-    
     try:
         # Add current interaction to traditional memory
         state = add_to_conversation_memory(
@@ -675,64 +748,50 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
             result=state["tool_results"],
             flow_step=f"{state['query_intent']}:{state['selected_tool']}"
         )
-        
         # Enhanced MCP context storage based on query intent
-        if state["query_intent"] == "next_patient" and state["tool_results"]:
-            # Store next patient information in MCP context
-            next_appointment = state["tool_results"][0] if state["tool_results"] else None
-            if next_appointment and isinstance(next_appointment, dict):
-                
-                # Add to traditional memory (backward compatibility)
+        # Store patient/appointment context for both next_patient and time_specific_lookup
+        if state["query_intent"] in ["next_patient", "time_specific_lookup"] and state["tool_results"]:
+            appointment = state["tool_results"][0] if state["tool_results"] else None
+            if appointment and isinstance(appointment, dict):
                 state["conversation_memory"]["implicit_references"]["current_patient"] = {
-                    "name": next_appointment.get("PatientName"),
-                    "id": next_appointment.get("PatientID"),
-                    "appointment_id": next_appointment.get("AppointmentID"),
+                    "name": appointment.get("PatientName"),
+                    "id": appointment.get("PatientID"),
+                    "appointment_id": appointment.get("AppointmentID"),
                     "timestamp": datetime.now().isoformat()
                 }
-                
-                # Add to MCP context manager
                 patient_context_id = mcp_context_manager.add_patient_context(
-                    patient_name=next_appointment.get("PatientName", "Unknown"),
-                    patient_id=str(next_appointment.get("PatientID", "")),
+                    patient_name=appointment.get("PatientName", "Unknown"),
+                    patient_id=str(appointment.get("PatientID", "")),
                     appointment_details={
-                        "appointment_id": next_appointment.get("AppointmentID"),
-                        "start_time": next_appointment.get("StartDateTime"),
-                        "end_time": next_appointment.get("EndDateTime"),
-                        "appointment_type": next_appointment.get("AppointmentType"),
-                        "status": next_appointment.get("Status")
+                        "appointment_id": appointment.get("AppointmentID"),
+                        "start_time": appointment.get("StartDateTime"),
+                        "end_time": appointment.get("EndDateTime"),
+                        "appointment_type": appointment.get("AppointmentType"),
+                        "status": appointment.get("Status")
                     },
                     session_id=session_id
                 )
-                
-                # Also add appointment context
                 appointment_context_id = mcp_context_manager.add_appointment_context(
-                    query_intent="next_patient",
+                    query_intent=state["query_intent"],
                     appointments=state["tool_results"],
                     session_id=session_id
                 )
-                
                 logger.info(f"Added MCP contexts: patient={patient_context_id}, appointment={appointment_context_id}")
-                
-                # Update patient context in state
                 state = update_patient_context(
                     state,
-                    patient_id=next_appointment.get("PatientID"),
-                    patient_name=next_appointment.get("PatientName"),
-                    appointment_id=next_appointment.get("AppointmentID"),
-                    appointment_date=next_appointment.get("StartDateTime")
+                    patient_id=appointment.get("PatientID"),
+                    patient_name=appointment.get("PatientName"),
+                    appointment_id=appointment.get("AppointmentID"),
+                    appointment_date=appointment.get("StartDateTime")
                 )
-        
-        elif state["query_intent"] == "schedule" and state["tool_results"]:
-            # Store schedule information in MCP context
+        if state["query_intent"] == "schedule" and state["tool_results"]:
             schedule_context_id = mcp_context_manager.add_schedule_context(
                 schedule_data=state["tool_results"],
                 date=datetime.now().strftime("%Y-%m-%d"),
                 session_id=session_id
             )
             logger.info(f"Added MCP schedule context: {schedule_context_id}")
-        
-        elif state["query_intent"] == "patient_history" and state["tool_results"]:
-            # Store patient history context
+        if state["query_intent"] == "patient_history" and state["tool_results"]:
             if state["resolved_references"].get("patient_name"):
                 patient_name = state["resolved_references"]["patient_name"]
                 patient_context_id = mcp_context_manager.add_patient_context(
@@ -746,26 +805,20 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
                     session_id=session_id
                 )
                 logger.info(f"Added MCP patient history context: {patient_context_id}")
-        
         # Update doctor context with recent activity
         if state.get("doctor_context") and state["tool_results"]:
             state["doctor_context"]["last_queried_date"] = datetime.now().strftime("%Y-%m-%d")
             if state["query_intent"] in ["schedule", "next_patient"]:
-                state["doctor_context"]["current_appointments"] = state["tool_results"][:5]  # Keep recent appointments
-        
+                state["doctor_context"]["current_appointments"] = state["tool_results"][:5]
         # Add response to message history for LangGraph
-        if state["formatted_response"]:
+        if state.get("formatted_response"):
             from langchain_core.messages import AIMessage
             state["messages"].append(AIMessage(content=state["formatted_response"]))
-        
         # Log MCP context summary for debugging
         mcp_summary = mcp_context_manager.get_context_summary(session_id)
         logger.info(f"MCP context summary: {mcp_summary['total_items']} items, types: {mcp_summary['context_types']}")
-        
         logger.info("Memory updated successfully with MCP integration")
-        
     except Exception as e:
         logger.error(f"Memory management error: {e}")
-        state["errors"].append(f"Memory update failed: {e}")
-    
+        state.setdefault("errors", []).append(f"Memory update failed: {e}")
     return state
