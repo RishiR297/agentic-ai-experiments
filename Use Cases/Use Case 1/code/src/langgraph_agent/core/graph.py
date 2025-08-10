@@ -14,7 +14,8 @@ from ..nodes.processing import (
     memory_manager_node,
     slot_validator_node
 )
-from ..nodes.multi_step_planner import multi_step_planner_node
+
+from ..nodes.processing import multi_step_planner_node
 
 logger = logging.getLogger(__name__)
 
