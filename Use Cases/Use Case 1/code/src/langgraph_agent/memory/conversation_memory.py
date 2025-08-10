@@ -26,7 +26,7 @@ class ConversationTurn:
     tool_used: str
     context_resolved: Dict[str, Any]
     timestamp: datetime
-    mcp_context_ids: List[str] = None  # Track associated MCP context items
+    mcp_context_ids: Optional[List[str]] = None  # Track associated MCP context items
     
     def __post_init__(self):
         if self.mcp_context_ids is None:
