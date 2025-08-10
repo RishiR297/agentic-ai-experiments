@@ -7,6 +7,7 @@ Contains all configuration settings, LLM setup, and system prompts.
 import os
 from typing import Dict, Any, List
 from langchain_openai import AzureChatOpenAI
+from langchain_core.pydantic_v1 import SecretStr
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,10 +19,9 @@ class AgentConfig:
     def __init__(self):
         # Azure OpenAI configuration
         self.llm = AzureChatOpenAI(
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_key=SecretStr(os.getenv("AZURE_OPENAI_API_KEY") or ""),
             api_version="2024-02-15-preview",
-            deployment_name=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"),
+            azure_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"),
             temperature=0.0
         )
         
@@ -37,14 +37,27 @@ class AgentConfig:
         # Tool configuration
         self.available_tools = [
             "appointment_lookup",
-            "schedule_query", 
+            "schedule_query",
             "patient_history",
             "doctor_availability",
-            "calendar_summary"
+            "calendar_summary",
+            "appointment_booking"
         ]
-        
+
+        # Centralized required user-facing fields per tool
+        self.tool_user_fields = {
+            "appointment_booking": ["service_name", "patient_name", "start_time", "appointment_date"],
+            "schedule_query": ["doctor_name", "appointment_date"],
+            "appointment_lookup": ["patient_name", "appointment_date"],
+            "patient_lookup": ["patient_name"],
+            # Add more tool-specific fields as needed
+        }
+
         # System prompts
         self.system_prompts = self._load_system_prompts()
+    def get_tool_user_fields(self, tool_name: str):
+        """Get required user-facing fields for a tool."""
+        return self.tool_user_fields.get(tool_name, [])
     
     def _load_system_prompts(self) -> Dict[str, str]:
         """Load all system prompts for different agent nodes."""
@@ -90,21 +103,27 @@ You are a tool selection specialist for a medical assistant. Based on the resolv
 
 Available tools:
 1. appointment_lookup - Find specific appointments by patient, doctor, date, or ID
-2. schedule_query - Get doctor's schedule for specific dates/times  
+2. schedule_query - Get doctor's schedule for specific dates/times
 3. patient_history - Retrieve patient medical history and past appointments
 4. doctor_availability - Check when doctors are available
 5. calendar_summary - Summarize schedule for a day/week
+6. appointment_booking - Book a new appointment (requires all required fields: patient_name, doctor_id, date, time, service_name)
 
 TOOL SELECTION GUIDELINES:
+- book_appointment intent → appointment_booking (ALWAYS use this tool for booking requests, not schedule_query)
 - next_patient intent → appointment_lookup for next upcoming appointment
 - patient_history intent → patient_history with patient ID
 - schedule intent → schedule_query with doctor and date
-- availability intent → doctor_availability 
+- availability intent → doctor_availability
 - summary intent → calendar_summary
 - time_specific_lookup intent → schedule_query with doctor, date, and time parameters
 
+CRITICAL:
+- For book_appointment intent, select appointment_booking and pass all required parameters (patient_name, doctor_id, date, time, service_name). Do NOT use schedule_query for booking requests.
+- Only use schedule_query for viewing schedules, not for booking.
+
 TIME-SPECIFIC HANDLING:
-CRITICAL: For time_specific_lookup intent:
+For time_specific_lookup intent:
 - Use schedule_query tool (NOT appointment_lookup)
 - Include time parameter in tool_parameters
 - Extract specific time from query (e.g., "2 PM" → "14:00")

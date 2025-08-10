@@ -1,23 +1,23 @@
-"""
-LangGraph Graph Definition for Multi-Turn Medical Assistant
-
-This module creates the main conversation flow graph that handles
-multi-turn conversations with context and memory management.
-"""
-
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage
 
 from .state import AgentState, create_initial_state
 from .config import AgentConfig
+
+# Import deterministic validation nodes/tools (pure logic, no LLM)
 from ..nodes.processing import (
     context_resolver_node,
     tool_selector_node,
     sql_generator_node,
+    tool_executor_node,
     response_formatter_node,
-    memory_manager_node
+    memory_manager_node,
+    slot_validator_node,
+    backend_lookup_node,
+    appointment_overlap_check_node,
+    doctor_schedule_check_node
 )
 
 logger = logging.getLogger(__name__)
@@ -32,62 +32,76 @@ def should_continue_processing(state: AgentState) -> str:
     return "continue"
 
 
-def create_medical_agent_graph() -> StateGraph:
-    """
-    Create the main LangGraph for the medical assistant.
-    
-    The graph follows this flow:
-    1. Context Resolution - Resolve implicit references and context
-    2. Tool Selection - Choose appropriate tool and parameters
-    3. SQL Generation - Generate and execute database queries
-    4. Response Formatting - Format results into natural language
-    5. Memory Management - Update conversation memory and context
-    """
-    
-    # Create the configuration
+
+def create_medical_agent_graph():
     config = AgentConfig()
-    
-    # Create the graph
     workflow = StateGraph(AgentState)
-    
-    # Add nodes with config binding
-    workflow.add_node("context_resolver", lambda state: context_resolver_node(state, config))
-    workflow.add_node("tool_selector", lambda state: tool_selector_node(state, config))
-    workflow.add_node("sql_generator", lambda state: sql_generator_node(state, config))
-    workflow.add_node("response_formatter", lambda state: response_formatter_node(state, config))
-    workflow.add_node("memory_manager", lambda state: memory_manager_node(state, config))
-    
-    # Set entry point
-    workflow.set_entry_point("context_resolver")
-    
-    # Define the flow
+
+    # Node wrappers for sync compatibility
+    def context_resolver_sync(state):
+        return context_resolver_node(state, config)
+    def tool_selector_sync(state):
+        return tool_selector_node(state, config)
+    def slot_validator_sync(state):
+        return slot_validator_node(state, config)
+    def backend_lookup_sync(state):
+        return backend_lookup_node(state, config)
+    def appointment_overlap_check_sync(state):
+        return appointment_overlap_check_node(state, config)
+    def doctor_schedule_check_sync(state):
+        return doctor_schedule_check_node(state, config)
+    def sql_generator_sync(state):
+        return sql_generator_node(state, config)
+    def tool_executor_sync(state):
+        return tool_executor_node(state, config)
+    def response_formatter_sync(state):
+        return response_formatter_node(state, config)
+    def memory_manager_sync(state):
+        return memory_manager_node(state, config)
+
+    # Register nodes (deterministic validation nodes are independent)
+    workflow.add_node("context_resolver", context_resolver_sync)
+    workflow.add_node("tool_selector", tool_selector_sync)
+    workflow.add_node("slot_validator", slot_validator_sync)
+    workflow.add_node("backend_lookup", backend_lookup_sync)
+    workflow.add_node("appointment_overlap_check", appointment_overlap_check_sync)
+    workflow.add_node("doctor_schedule_check", doctor_schedule_check_sync)
+    workflow.add_node("sql_generator", sql_generator_sync)
+    workflow.add_node("tool_executor", tool_executor_sync)
+    workflow.add_node("response_formatter", response_formatter_sync)
+    workflow.add_node("memory_manager", memory_manager_sync)
+
+    # Example: Linear deterministic validation flow (can be orchestrated by LLM supervisor node)
     workflow.add_edge("context_resolver", "tool_selector")
-    workflow.add_edge("tool_selector", "sql_generator")
-    workflow.add_edge("sql_generator", "response_formatter")
+    workflow.add_edge("tool_selector", "slot_validator")
+    workflow.add_edge("slot_validator", "backend_lookup")
+    workflow.add_edge("backend_lookup", "appointment_overlap_check")
+    workflow.add_edge("appointment_overlap_check", "doctor_schedule_check")
+    workflow.add_edge("doctor_schedule_check", "sql_generator")
+    workflow.add_edge("sql_generator", "tool_executor")
+    workflow.add_edge("tool_executor", "response_formatter")
     workflow.add_edge("response_formatter", "memory_manager")
     workflow.add_edge("memory_manager", END)
-    
-    # Compile the graph
-    return workflow.compile()
+
+    # Set entry point after all edges
+    workflow.set_entry_point("context_resolver")
+
+    # Optional: Debug prints
+    logger.debug("[DEBUG] Registered nodes: %s", list(workflow.nodes.keys()))
+    logger.debug("[DEBUG] Registered edges: %s", list(workflow.edges))
+
+    compiled_graph = workflow.compile()
+    return compiled_graph
 
 
 class MedicalAssistantAgent:
-    """
-    Main agent class that manages conversation state and processing.
-    """
-    
     def __init__(self):
         self.graph = create_medical_agent_graph()
         self.config = AgentConfig()
         self.sessions: Dict[str, AgentState] = {}
-    
-    def get_or_create_session(
-        self, 
-        session_id: str, 
-        user_role: str, 
-        doctor_id: str = None
-    ) -> AgentState:
-        """Get existing session or create new one."""
+
+    def get_or_create_session(self, session_id: str, user_role: str, doctor_id: Optional[str] = None) -> AgentState:
+        doctor_id = doctor_id or ""
         if session_id not in self.sessions:
             self.sessions[session_id] = create_initial_state(
                 user_role=user_role,
@@ -95,97 +109,60 @@ class MedicalAssistantAgent:
                 session_id=session_id
             )
         return self.sessions[session_id]
-    
+
     def process_message(
-        self, 
-        message: str, 
-        session_id: str, 
-        user_role: str, 
-        doctor_id: str = None,
-        identity_context: Dict[str, Any] = None
+        self,
+        message: str,
+        session_id: str,
+        user_role: str,
+        doctor_id: Optional[str] = None,
+        identity_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """
-        Process a user message through the agent graph.
-        
-        Returns:
-            Dict containing response, metadata, and conversation state
-        """
         try:
-            # Get or create session state
             state = self.get_or_create_session(session_id, user_role, doctor_id)
-            
-            # Add identity context to state if provided
             if identity_context:
                 state["identity_context"] = identity_context
                 logger.info(f"Added identity context: {identity_context}")
-            
-            # Add user message to state
+
+            # Reset relevant state
             state["current_query"] = message
             state["messages"].append(HumanMessage(content=message))
-            
-            # Reset processing state
             state["errors"] = []
             state["has_errors"] = False
             state["tool_results"] = None
             state["formatted_response"] = ""
             state["sql_metadata"] = {}
-            
+
             logger.info(f"Processing message for session {session_id}: {message}")
-            
-            # Run the graph
+
             result = self.graph.invoke(state)
-            
-            # Update session state
             self.sessions[session_id] = result
-            
-            # Debug logging
+
             logger.info(f"Graph result - formatted_response: '{result['formatted_response']}'")
-            logger.info(f"Graph result - has_errors: {result['has_errors']}")
-            logger.info(f"Graph result keys: {list(result.keys())}")
-            logger.info(f"Graph result sql_metadata: {result.get('sql_metadata', 'NOT_FOUND')}")
-            
-            # Return processed result
+
             return {
-                "success": not result["has_errors"],
-                "result": result["formatted_response"],
-                "metadata": result["response_metadata"],
+                "success": not result.get("has_errors", False),
+                "result": result.get("formatted_response", ""),
+                "metadata": result.get("response_metadata", {}),
                 "tool_name": result.get("selected_tool", "unknown"),
                 "sql_metadata": result.get("sql_metadata", {}),
                 "session_id": session_id,
                 "conversation_context": {
-                    "patient_context": result.get("patient_context"),
-                    "query_intent": result.get("query_intent"),
-                    "resolved_references": result.get("resolved_references")
+                    "patient_context": result.get("patient_context", {}),
+                    "query_intent": result.get("query_intent", ""),
+                    "resolved_references": result.get("resolved_references", {})
                 }
             }
-            
         except Exception as e:
-            logger.error(f"Agent processing error: {e}")
+            logger.exception(f"Agent processing error: {e}")
             return {
                 "success": False,
-                "result": f"I encountered an error processing your request: {str(e)}",
-                "metadata": {"error": str(e)},
-                "tool_name": "error_handler",
-                "session_id": session_id
+                "error": str(e)
             }
-    
-    def get_session_context(self, session_id: str) -> Dict[str, Any]:
-        """Get current context for a session."""
-        if session_id in self.sessions:
-            state = self.sessions[session_id]
-            return {
-                "patient_context": state.get("patient_context"),
-                "doctor_context": state.get("doctor_context"),
-                "conversation_memory": state["conversation_memory"],
-                "message_count": len(state["messages"])
-            }
-        return {}
-    
+
     def clear_session(self, session_id: str):
-        """Clear a specific session."""
         if session_id in self.sessions:
             del self.sessions[session_id]
-    
+
     def list_active_sessions(self) -> List[str]:
-        """List all active session IDs."""
         return list(self.sessions.keys())

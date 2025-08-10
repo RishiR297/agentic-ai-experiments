@@ -73,6 +73,167 @@ class HealthResponse(BaseModel):
     agent_status: str
     active_sessions: int
 
+# --- Slot Validation API Models ---
+class SlotValidationRequest(BaseModel):
+    """
+    Request model for /slot_validation endpoint.
+    Example:
+    {
+        "session_id": "doctor_1_20250714",
+        "user_role": "doctor",
+        "doctor_id": "1",
+        "tool": "appointment_booking",
+        "tool_parameters": {"service_name": "Facial", "patient_name": "Eva Davis", "start_time": "2025-07-30 14:00:00"},
+        "resolved_references": {}
+    }
+    """
+    session_id: Optional[str] = None
+    user_role: Optional[str] = None
+    doctor_id: Optional[str] = None
+    tool: str
+    tool_parameters: Dict[str, Any] = {}
+    resolved_references: Dict[str, Any] = {}
+
+class SlotValidationResponse(BaseModel):
+    """
+    Response model for /slot_validation endpoint.
+    Example:
+    {
+        "success": true,
+        "slot_validation": {"status": "missing", "fields": ["start_time"]},
+        "clarification_prompt": "What time would you like to book the appointment?",
+        "required_lookups": ["StatusId", "PatientId", "BranchName", "ServiceId", "BranchId"],
+        "tool_parameters": {"service_name": "Facial", "patient_name": "Eva Davis"},
+        "has_errors": false
+    }
+    """
+    success: bool
+    slot_validation: Dict[str, Any]
+    clarification_prompt: Optional[str] = None
+    required_lookups: Optional[list] = None
+    tool_parameters: Dict[str, Any] = {}
+    has_errors: bool = False
+
+class ClarifyRequest(BaseModel):
+    """
+    Request model for /clarify endpoint.
+    Example:
+    {
+        "missing_fields": ["start_time"],
+        "tool": "appointment_booking",
+        "tool_parameters": {"service_name": "Facial", "patient_name": "Eva Davis"},
+        "context": {"user_role": "doctor", "doctor_id": "1"}
+    }
+    """
+    missing_fields: list
+    tool: str
+    tool_parameters: Dict[str, Any] = {}
+    context: Dict[str, Any] = {}
+
+class ClarifyResponse(BaseModel):
+    """
+    Response model for /clarify endpoint.
+    Example:
+    {
+        "clarification_prompt": "What time would you like to book the appointment?"
+    }
+    """
+    clarification_prompt: str
+# --- Slot Validation Endpoint ---
+@app.post("/slot_validation", response_model=SlotValidationResponse)
+async def slot_validation_endpoint(request: SlotValidationRequest):
+    """
+    Validate required user-facing fields for a tool and generate clarification prompt if needed.
+    Returns slot validation status, clarification prompt, required backend lookups, and merged tool parameters.
+
+    Example request:
+    {
+        "session_id": "doctor_1_20250714",
+        "user_role": "doctor",
+        "doctor_id": "1",
+        "tool": "appointment_booking",
+        "tool_parameters": {"service_name": "Facial", "patient_name": "Eva Davis"},
+        "resolved_references": {}
+    }
+    """
+    try:
+        # Use or create session for context
+        session_id = request.session_id or f"slotval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        user_role = request.user_role or "assistant"
+        doctor_id = request.doctor_id
+        # Build a minimal agent state for slot validation
+        state = {
+            "session_id": session_id,
+            "user_role": user_role,
+            "doctor_id": doctor_id,
+            "selected_tool": request.tool,
+            "tool_parameters": request.tool_parameters,
+            "resolved_references": request.resolved_references,
+            "errors": [],
+            "has_errors": False
+        }
+        # Call the slot_validator_node directly
+        from langgraph_agent.nodes.processing import slot_validator_node
+        from langgraph_agent.core.config import AgentConfig
+        config = AgentConfig()
+        state = slot_validator_node(state, config)
+        return SlotValidationResponse(
+            success=True,
+            slot_validation=state.get("slot_validation", {}),
+            clarification_prompt=state.get("clarification_prompt", None),
+            required_lookups=state.get("required_lookups", []),
+            tool_parameters=state.get("tool_parameters", {}),
+            has_errors=state.get("has_errors", False)
+        )
+    except Exception as e:
+        logger.error(f"Slot validation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Clarification Prompt Endpoint ---
+@app.post("/clarify", response_model=ClarifyResponse)
+async def clarify_endpoint(request: ClarifyRequest):
+    """
+    Generate a personalized clarification prompt for missing fields using the LLM.
+    Returns a natural language prompt for the user.
+
+    Example request:
+    {
+        "missing_fields": ["start_time"],
+        "tool": "appointment_booking",
+        "tool_parameters": {"service_name": "Facial", "patient_name": "Eva Davis"},
+        "context": {"user_role": "doctor", "doctor_id": "1"}
+    }
+    """
+    try:
+        from langgraph_agent.core.config import AgentConfig
+        config = AgentConfig()
+        # Compose the LLM prompt as in slot_validator_node
+        system_prompt = (
+            "You are a helpful medical assistant agent. "
+            "Given the current tool, parameters, and context, generate a polite, context-aware message asking ONLY for the missing user-facing fields. "
+            "Use available context (patient name, doctor, service, date, time) to make your question natural and specific. "
+            "If only one field is missing, ask for it directly. If multiple are missing, ask for all together. Never ask for fields that are already filled. "
+            "Respond in plain English, not JSON."
+        )
+        llm_input = {
+            "tool": request.tool,
+            "parameters": request.tool_parameters,
+            "missing_fields": request.missing_fields,
+            "context": request.context
+        }
+        from langchain_core.messages import SystemMessage, HumanMessage
+        import json
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(llm_input, default=str))
+        ]
+        response = config.llm.invoke(messages)
+        clarification_prompt = response.content.strip()
+        return ClarifyResponse(clarification_prompt=clarification_prompt)
+    except Exception as e:
+        logger.error(f"Clarification prompt error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Role validation
 VALID_ROLES = ["doctor", "assistant"]
 
@@ -109,7 +270,137 @@ def generate_session_id(user_role: str, doctor_id: str = None) -> str:
         return f"{user_role}_{doctor_id}_{timestamp}"
     return f"{user_role}_{timestamp}"
 
+
+# --- Additional API Models ---
+class ConversationReplayResponse(BaseModel):
+    session_id: str
+    history: list
+
+class PlannerResponse(BaseModel):
+    session_id: str
+    next_steps: list
+    current_state: Dict[str, Any]
+
+class SessionSummaryRequest(BaseModel):
+    session_id: str
+
+class SessionSummaryResponse(BaseModel):
+    summary: str
+    details: Dict[str, Any] = {}
+
+class ContextResolutionResponse(BaseModel):
+    session_id: str
+    resolved_references: Dict[str, Any]
+
+class MemoryMutationRequest(BaseModel):
+    session_id: str
+    updates: Dict[str, Any]
+
+class MemoryMutationResponse(BaseModel):
+    session_id: str
+    updated_context: Dict[str, Any]
+
 # API Endpoints
+@app.get("/conversation/{session_id}/replay", response_model=ConversationReplayResponse)
+async def conversation_replay(session_id: str):
+    """
+    Retrieve the full conversation history for a session.
+    Example response:
+    {"session_id": "doctor_1_20250714", "history": [{"role": "doctor", "message": "..."}, ...]}
+    """
+    try:
+        # Stub: implement get_conversation_history in agent if not present
+        if not hasattr(agent, "get_conversation_history"):
+            def get_conversation_history(session_id):
+                ctx = agent.get_session_context(session_id)
+                return ctx.get("conversation_history", []) if ctx else []
+            agent.get_conversation_history = get_conversation_history
+        history = agent.get_conversation_history(session_id)
+        return ConversationReplayResponse(session_id=session_id, history=history)
+    except Exception as e:
+        logger.error(f"Conversation replay error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/planner/{session_id}", response_model=PlannerResponse)
+async def get_planner_state(session_id: str):
+    """
+    Get the planned next steps and current state for a session.
+    Example response:
+    {"session_id": "doctor_1_20250714", "next_steps": ["slot_validation", "backend_lookup"], "current_state": {...}}
+    """
+    try:
+        # Stub: implement get_next_steps in agent if not present
+        if not hasattr(agent, "get_next_steps"):
+            def get_next_steps(session_id):
+                ctx = agent.get_session_context(session_id)
+                return ctx.get("planned_steps", []) if ctx else []
+            agent.get_next_steps = get_next_steps
+        state = agent.get_session_context(session_id)
+        next_steps = agent.get_next_steps(session_id)
+        return PlannerResponse(session_id=session_id, next_steps=next_steps, current_state=state)
+    except Exception as e:
+        logger.error(f"Planner state error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/session/summary", response_model=SessionSummaryResponse)
+async def session_summary(request: SessionSummaryRequest):
+    """
+    Generate a summary of the session's conversation and actions.
+    Example request:
+    {"session_id": "doctor_1_20250714"}
+    Example response:
+    {"summary": "You booked 2 appointments for Eva Davis.", "details": {...}}
+    """
+    try:
+        # Stub: implement generate_session_summary in agent if not present
+        if not hasattr(agent, "generate_session_summary"):
+            def generate_session_summary(session_id):
+                return "Session summary not implemented.", {}
+            agent.generate_session_summary = generate_session_summary
+        summary, details = agent.generate_session_summary(request.session_id)
+        return SessionSummaryResponse(summary=summary, details=details)
+    except Exception as e:
+        logger.error(f"Session summary error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/context/{session_id}/resolved", response_model=ContextResolutionResponse)
+async def get_resolved_references(session_id: str):
+    """
+    Get resolved references/entities for a session.
+    Example response:
+    {"session_id": "doctor_1_20250714", "resolved_references": {"patient_id": 5, "service_id": 2}}
+    """
+    try:
+        context = agent.get_session_context(session_id)
+        resolved = context.get("resolved_references", {}) if context else {}
+        return ContextResolutionResponse(session_id=session_id, resolved_references=resolved)
+    except Exception as e:
+        logger.error(f"Context resolution error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/memory/{session_id}/mutate", response_model=MemoryMutationResponse)
+async def mutate_memory(request: MemoryMutationRequest):
+    """
+    Mutate the session memory/context (for testing/admin only).
+    Example request:
+    {"session_id": "doctor_1_20250714", "updates": {"patient_context": {"name": "Eva Davis"}}}
+    Example response:
+    {"session_id": "doctor_1_20250714", "updated_context": {...}}
+    """
+    try:
+        # Stub: implement mutate_session_context in agent if not present
+        if not hasattr(agent, "mutate_session_context"):
+            def mutate_session_context(session_id, updates):
+                ctx = agent.get_session_context(session_id)
+                if ctx is not None:
+                    ctx.update(updates)
+                return ctx
+            agent.mutate_session_context = mutate_session_context
+        updated = agent.mutate_session_context(request.session_id, request.updates)
+        return MemoryMutationResponse(session_id=request.session_id, updated_context=updated)
+    except Exception as e:
+        logger.error(f"Memory mutation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -384,7 +675,7 @@ async def get_mcp_summary():
 async def demo_test():
     """
     Demo endpoint for API testing.
-    Returns sample request/response format.
+    Returns sample request/response format, including new slot validation, clarify, and advanced endpoints.
     """
     return {
         "api_name": "LangGraph Medical Assistant API",
@@ -418,9 +709,60 @@ async def demo_test():
                 "resolved_references": {}
             }
         },
+        "slot_validation_example": {
+            "method": "POST",
+            "endpoint": "/slot_validation",
+            "body": {
+                "session_id": "doctor_1_20250714",
+                "user_role": "doctor",
+                "doctor_id": "1",
+                "tool": "appointment_booking",
+                "tool_parameters": {"service_name": "Facial", "patient_name": "Eva Davis"},
+                "resolved_references": {}
+            }
+        },
+        "clarify_example": {
+            "method": "POST",
+            "endpoint": "/clarify",
+            "body": {
+                "missing_fields": ["start_time"],
+                "tool": "appointment_booking",
+                "tool_parameters": {"service_name": "Facial", "patient_name": "Eva Davis"},
+                "context": {"user_role": "doctor", "doctor_id": "1"}
+            }
+        },
+        "conversation_replay_example": {
+            "method": "GET",
+            "endpoint": "/conversation/doctor_1_20250714/replay"
+        },
+        "planner_example": {
+            "method": "GET",
+            "endpoint": "/planner/doctor_1_20250714"
+        },
+        "session_summary_example": {
+            "method": "POST",
+            "endpoint": "/session/summary",
+            "body": {"session_id": "doctor_1_20250714"}
+        },
+        "resolved_references_example": {
+            "method": "GET",
+            "endpoint": "/context/doctor_1_20250714/resolved"
+        },
+        "memory_mutation_example": {
+            "method": "POST",
+            "endpoint": "/memory/doctor_1_20250714/mutate",
+            "body": {"session_id": "doctor_1_20250714", "updates": {"patient_context": {"name": "Eva Davis"}}}
+        },
         "available_endpoints": [
             "POST /chat - Main chat interface",
+            "POST /slot_validation - Slot validation and clarification prompt",
+            "POST /clarify - Generate clarification prompt for missing fields",
             "GET /context/{session_id} - Session context",
+            "GET /context/{session_id}/resolved - Resolved references/entities",
+            "GET /conversation/{session_id}/replay - Conversation history",
+            "GET /planner/{session_id} - Planner next steps and state",
+            "POST /session/summary - Session summary",
+            "POST /memory/{session_id}/mutate - Mutate session memory/context",
             "GET /tools - Available tools by role",
             "GET /health - Health check",
             "GET /mcp/summary - MCP system summary",
@@ -448,7 +790,14 @@ async def root():
         ],
         "endpoints": {
             "POST /chat": "Main chat interface with role-based access",
+            "POST /slot_validation": "Slot validation and clarification prompt",
+            "POST /clarify": "Generate clarification prompt for missing fields",
             "GET /context/{session_id}": "Get conversation context and memory",
+            "GET /context/{session_id}/resolved": "Resolved references/entities",
+            "GET /conversation/{session_id}/replay": "Conversation history",
+            "GET /planner/{session_id}": "Planner next steps and state",
+            "POST /session/summary": "Session summary",
+            "POST /memory/{session_id}/mutate": "Mutate session memory/context",
             "GET /tools": "List available tools for user role",
             "GET /health": "Health check and system status",
             "GET /mcp/summary": "MCP system summary and features",
