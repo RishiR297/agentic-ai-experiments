@@ -166,7 +166,7 @@ def create_mcp_enhanced_graph():
     from ..nodes.processing import (
         tool_selector_node,
         sql_generator_node,
-        response_formatter_node
+        response_formatter_node,
     )
     
     # Create the graph
