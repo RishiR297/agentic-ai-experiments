@@ -655,6 +655,7 @@ def clean_json_response(response_content: str) -> str:
             before_comment = line[:comment_pos]
             quote_count = before_comment.count('"') - before_comment.count('\\"')
             if quote_count % 2 == 0:
+            if quote_count % 2 == 0:
                 line = line[:comment_pos].rstrip()
         cleaned_lines.append(line)
     
@@ -765,6 +766,19 @@ Output Schema:
   \"context_updates\": { ... }
 }
 """.strip()
+    # Refined system prompt: all rules and output schema in SystemMessage
+    system_prompt = """
+You are a medical assistant context resolver.
+- Resolve vague references (e.g. 'him', 'her', 'next patient') using MCP context, recent messages, and date mappings.
+- Respond with ONLY a valid JSON object (no markdown, no explanation, no preamble).
+- If any value cannot be resolved, set it to null.
+Output Schema:
+{
+  \"query_intent\": "...",
+  \"resolved_references\": { ... },
+  \"context_updates\": { ... }
+}
+""".strip()
     mcp_context_summary = mcp_context_manager.get_context_summary(session_id)
     context_info = {
         "current_query": state["current_query"],
@@ -774,6 +788,7 @@ Output Schema:
         "doctor_context": state.get("doctor_context"),
         "conversation_memory": state["conversation_memory"],
         "recent_messages": [msg.content for msg in state["messages"][-5:] if hasattr(msg, 'content')],
+        "recent_messages": [msg.content for msg in state["messages"][-5:] if hasattr(msg, 'content')],
         "mcp_context_summary": mcp_context_summary,
         "mcp_resolved_references": mcp_resolved_refs,
         "date_mappings": date_mappings,
@@ -782,6 +797,7 @@ Output Schema:
     try:
         messages = [
             SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(context_info, indent=2, default=str))
             HumanMessage(content=json.dumps(context_info, indent=2, default=str))
         ]
         response = config.llm.invoke(messages)
@@ -810,7 +826,21 @@ Output Schema:
         # - LLM output takes precedence
         # - MCP fills gaps
         # - Date mappings are injected into the same object
+        # Booking-intent fallback heuristic (traceable override)
+        if state["query_intent"] == "time_specific_lookup":
+            booking_verbs = ["book", "schedule", "add", "make", "create", "set", "reserve"]
+            query_words = re.findall(r'\b\w+\b', state["current_query"].lower())
+            if any(verb in query_words for verb in booking_verbs):
+                # Preserve original intent for debugging/multi-intent
+                state["query_intent_original"] = state["query_intent"]
+                state["query_intent"] = "book_appointment"
+                logger.warning("Overriding intent: time_specific_lookup → book_appointment (based on verb match)")
+        # Final resolved references:
+        # - LLM output takes precedence
+        # - MCP fills gaps
+        # - Date mappings are injected into the same object
         llm_resolved = result.get("resolved_references", {})
+        final_resolved = {**mcp_resolved_refs, **date_mappings, **llm_resolved}
         final_resolved = {**mcp_resolved_refs, **date_mappings, **llm_resolved}
         state["resolved_references"] = final_resolved
         context_updates = result.get("context_updates", {})
@@ -1256,7 +1286,14 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
         if state["query_intent"] in ["next_patient", "time_specific_lookup"] and state["tool_results"]:
             appointment = state["tool_results"][0] if state["tool_results"] else None
             if appointment and isinstance(appointment, dict):
+        # Store patient/appointment context for both next_patient and time_specific_lookup
+        if state["query_intent"] in ["next_patient", "time_specific_lookup"] and state["tool_results"]:
+            appointment = state["tool_results"][0] if state["tool_results"] else None
+            if appointment and isinstance(appointment, dict):
                 state["conversation_memory"]["implicit_references"]["current_patient"] = {
+                    "name": appointment.get("PatientName"),
+                    "id": appointment.get("PatientID"),
+                    "appointment_id": appointment.get("AppointmentID"),
                     "name": appointment.get("PatientName"),
                     "id": appointment.get("PatientID"),
                     "appointment_id": appointment.get("AppointmentID"),
@@ -1265,7 +1302,14 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
                 patient_context_id = mcp_context_manager.add_patient_context(
                     patient_name=appointment.get("PatientName", "Unknown"),
                     patient_id=str(appointment.get("PatientID", "")),
+                    patient_name=appointment.get("PatientName", "Unknown"),
+                    patient_id=str(appointment.get("PatientID", "")),
                     appointment_details={
+                        "appointment_id": appointment.get("AppointmentID"),
+                        "start_time": appointment.get("StartDateTime"),
+                        "end_time": appointment.get("EndDateTime"),
+                        "appointment_type": appointment.get("AppointmentType"),
+                        "status": appointment.get("Status")
                         "appointment_id": appointment.get("AppointmentID"),
                         "start_time": appointment.get("StartDateTime"),
                         "end_time": appointment.get("EndDateTime"),
@@ -1275,6 +1319,7 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
                     session_id=session_id
                 )
                 appointment_context_id = mcp_context_manager.add_appointment_context(
+                    query_intent=state["query_intent"],
                     query_intent=state["query_intent"],
                     appointments=state["tool_results"],
                     session_id=session_id
@@ -1286,7 +1331,12 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
                     patient_name=appointment.get("PatientName"),
                     appointment_id=appointment.get("AppointmentID"),
                     appointment_date=appointment.get("StartDateTime")
+                    patient_id=appointment.get("PatientID"),
+                    patient_name=appointment.get("PatientName"),
+                    appointment_id=appointment.get("AppointmentID"),
+                    appointment_date=appointment.get("StartDateTime")
                 )
+        if state["query_intent"] == "schedule" and state["tool_results"]:
         if state["query_intent"] == "schedule" and state["tool_results"]:
             schedule_context_id = mcp_context_manager.add_schedule_context(
                 schedule_data=state["tool_results"],
@@ -1294,6 +1344,7 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
                 session_id=session_id
             )
             logger.info(f"Added MCP schedule context: {schedule_context_id}")
+        if state["query_intent"] == "patient_history" and state["tool_results"]:
         if state["query_intent"] == "patient_history" and state["tool_results"]:
             if state["resolved_references"].get("patient_name"):
                 patient_name = state["resolved_references"]["patient_name"]
@@ -1312,6 +1363,7 @@ def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
         if state.get("doctor_context") and state["tool_results"]:
             state["doctor_context"]["last_queried_date"] = datetime.now().strftime("%Y-%m-%d")
             if state["query_intent"] in ["schedule", "next_patient"]:
+                state["doctor_context"]["current_appointments"] = state["tool_results"][:5]
                 state["doctor_context"]["current_appointments"] = state["tool_results"][:5]
         # Add response to message history for LangGraph
         if state.get("formatted_response"):

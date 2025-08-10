@@ -528,10 +528,31 @@ async def get_context(session_id: str):
         context = agent.get_session_context(session_id)
         if not context:
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
+        # Import the MCP context manager and get full MCP context items for this session
+        from langgraph_agent.tools.mcp_context_manager import mcp_context_manager
+        mcp_items = mcp_context_manager.get_session_context(session_id)
+        mcp_context = [
+            {
+                "id": item.id,
+                "type": item.type,
+                "content": item.content,
+                "created_at": item.created_at.isoformat(),
+                "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+                "session_id": item.session_id,
+                "relevance_score": item.relevance_score
+            }
+            for item in mcp_items
+        ]
+
+        # Also provide a summary for convenience
+        mcp_summary = mcp_context_manager.get_context_summary(session_id)
+
         return {
             "session_id": session_id,
             "context": context,
+            "mcp_context": mcp_context,
+            "mcp_context_summary": mcp_summary,
             "timestamp": datetime.now().isoformat(),
             "memory_summary": {
                 "message_count": context.get("message_count", 0),
@@ -541,7 +562,6 @@ async def get_context(session_id: str):
                 "conversation_memory": context.get("conversation_memory", {})
             }
         }
-        
     except Exception as e:
         logger.error(f"Get context error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
