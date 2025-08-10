@@ -2,11 +2,17 @@
 Streamlit Web Interface for LangGraph Medical Assistant
 Provides a user-friendly chat interface for doctors and assistants with detailed diagnostics.
 """
+
 import streamlit as st
 import requests
 import json
 from datetime import datetime
 from typing import Dict, Any, List
+# Import robust DB connection utility
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+from src.db.db_utils import get_db_connection
 
 # Page configuration
 st.set_page_config(
@@ -22,10 +28,8 @@ API_BASE_URL = "http://127.0.0.1:8001"
 def get_doctor_mappings():
     """Get doctor ID to name mappings from the database."""
     try:
-        import sqlite3
-        conn = sqlite3.connect('code/src/db/output.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        
         # Get distinct doctor mappings, prioritizing by recent appointments
         cursor.execute("""
             SELECT DoctorId, DoctorName, COUNT(*) as appointment_count, MAX(StartDateTime) as latest_appointment
@@ -33,7 +37,6 @@ def get_doctor_mappings():
             GROUP BY DoctorId, DoctorName
             ORDER BY latest_appointment DESC, appointment_count DESC
         """)
-        
         mappings = {}
         for doctor_id, doctor_name, count, latest in cursor.fetchall():
             # Use the first (most recent/active) mapping for each doctor_id
@@ -43,33 +46,26 @@ def get_doctor_mappings():
                     'appointment_count': count,
                     'latest_appointment': latest
                 }
-        
         conn.close()
         return mappings
     except Exception as e:
         st.error(f"Error loading doctor mappings: {e}")
-        return {1: {'name': 'Antonella', 'appointment_count': 0, 'latest_appointment': None}}
+        return {11: {'name': 'Antonella', 'appointment_count': 0, 'latest_appointment': None}}
 
 def initialize_session_state():
     """Initialize session state variables if they don't exist."""
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-    
     if "user_role" not in st.session_state:
         st.session_state.user_role = "doctor"
-    
     if "doctor_id" not in st.session_state:
-        st.session_state.doctor_id = "1"  # Default to Dr. Antonella (DoctorId 1)
-    
+        st.session_state.doctor_id = "11"  # Default to Dr. Antonella (DoctorId 1)
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    
     if "conversation_id" not in st.session_state:
         st.session_state.conversation_id = None
-    
     if "diagnostics_enabled" not in st.session_state:
         st.session_state.diagnostics_enabled = True
-    
     # Load doctor mappings
     if "doctor_mappings" not in st.session_state:
         st.session_state.doctor_mappings = get_doctor_mappings()
@@ -638,21 +634,27 @@ def main():
     # Show current role info
     role_color = "blue" if user_role == "doctor" else "green"
     if user_role == "doctor":
-        # Get doctor name from mappings
         doctor_mappings = st.session_state.doctor_mappings
         doctor_id = st.session_state.doctor_id
+        doctor_name = None
+        # Debug: print doctor_mappings and doctor_id type
+        print(f"[DEBUG] doctor_mappings keys: {list(doctor_mappings.keys())}")
+        print(f"[DEBUG] doctor_id value: {doctor_id}, type: {type(doctor_id)}")
+        # Try both int and str keys for robustness
+        doctor_info = None
         try:
             doctor_id_int = int(doctor_id)
-            if doctor_id_int in doctor_mappings:
-                doctor_name = doctor_mappings[doctor_id_int]['name']
-                role_display = f"Dr. {doctor_name} (ID: {doctor_id})"
-            else:
-                role_display = f"Doctor (ID: {doctor_id})"
-        except ValueError:
-            role_display = f"Doctor (ID: {doctor_id})"
+            doctor_info = doctor_mappings.get(doctor_id_int)
+        except Exception:
+            doctor_info = None
+        print(f"[DEBUG] doctor_info for doctor_id {doctor_id}: {doctor_info}")
+        if doctor_info and doctor_info.get('name'):
+            doctor_name = doctor_info['name']
+            role_display = f"Dr. {doctor_name} (ID: {doctor_id})"
+        else:
+            role_display = f"Dr. Unknown Doctor (ID: {doctor_id})"
     else:
         role_display = "Assistant"
-    
     st.markdown(f"**Current Role:** :{role_color}[{role_display}]")
     
     # Display chat history
