@@ -80,6 +80,11 @@ class AgentState(TypedDict):
     # Response generation
     formatted_response: str
     response_metadata: Dict[str, Any]
+    clarification_prompt: Optional[str]
+    
+    # Slot validation
+    slot_validation: Optional[Dict[str, Any]]
+    required_lookups: Optional[List[str]]
     
     # Error handling
     errors: List[str]
@@ -126,6 +131,9 @@ def create_initial_state(
         sql_metadata={},
         formatted_response="",
         response_metadata={},
+        clarification_prompt=None,
+        slot_validation=None,
+        required_lookups=None,
         errors=[],
         has_errors=False
     )
