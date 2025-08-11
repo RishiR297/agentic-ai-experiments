@@ -1,10 +1,11 @@
 import logging
 from typing import Dict, Any, List, Optional
+from datetime import datetime
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage
 
-from .base import AgentState, AgentConfig
-from .state import create_initial_state
+from .state import AgentState, create_initial_state
+from .config import AgentConfig
 from ..nodes.processing import (
     context_resolver_node,
     tool_selector_node,
@@ -15,69 +16,64 @@ from ..nodes.processing import (
     slot_validator_node
 )
 
-from ..nodes.processing import multi_step_planner_node
-
 logger = logging.getLogger(__name__)
 
-
-def should_continue_processing(state: AgentState) -> str:
-    """Determine if processing should continue or end."""
-    if state["has_errors"] and len(state["errors"]) > 3:
-        return "end"
-    if not state["current_query"].strip():
-        return "end"
-    return "continue"
-
-
-
 def create_medical_agent_graph():
+    """Create the medical assistant graph using TypedDict AgentState."""
     config = AgentConfig()
     workflow = StateGraph(AgentState)
     
-    # Add nodes with config binding
-
+    # Add nodes directly - TypedDict handles field validation
     workflow.add_node("context_resolver", lambda state: context_resolver_node(state, config))
     workflow.add_node("tool_selector", lambda state: tool_selector_node(state, config))
-    workflow.add_node("multi_step_planner", lambda state: multi_step_planner_node(state, config))
     workflow.add_node("slot_validator", lambda state: slot_validator_node(state, config))
-    # Add backend_lookup_node if missing
-    from ..nodes.processing import backend_lookup_node
-    workflow.add_node("backend_lookup_node", lambda state: backend_lookup_node(state, config))
+    workflow.add_node("backend_lookup", lambda state: backend_lookup_node(state, config))
     workflow.add_node("sql_generator", lambda state: sql_generator_node(state, config))
+    workflow.add_node("tool_executor", lambda state: tool_executor_node(state, config))
     workflow.add_node("response_formatter", lambda state: response_formatter_node(state, config))
     workflow.add_node("memory_manager", lambda state: memory_manager_node(state, config))
+
+    # Import backend_lookup_node function
+    def backend_lookup_node(state, config):
+        from ..nodes.processing import backend_lookup_node as lookup_fn
+        return lookup_fn(state, config)
 
     # Set entry point
     workflow.set_entry_point("context_resolver")
 
-    # Define the flow
+    # Add edges
     workflow.add_edge("context_resolver", "tool_selector")
-    workflow.add_edge("tool_selector", "multi_step_planner")
-    workflow.add_edge("multi_step_planner", "slot_validator")
-    # Replace slot_routing with direct conditional routing from slot_validator
-    def route_from_slot_validator(state):
-        # If all required fields are present, go to sql_generator
-        if state.get("slot_validation", {}).get("status") == "ok":
+    workflow.add_edge("tool_selector", "slot_validator")
+    
+    # Conditional routing from slot_validator
+    def route_after_validation(state):
+        status = state.get("slot_validation", {}).get("status")
+        logger.info(f"Routing after validation: status={status}")
+        
+        if status == "ok":
             return "sql_generator"
-        # If missing natural fields, go to multi_step_planner
-        if state.get("slot_validation", {}).get("status") == "missing":
-            return "multi_step_planner"
-        # If missing backend fields, go to backend_lookup_node
-        if state.get("slot_validation", {}).get("status") == "missing_backend":
-            return "backend_lookup_node"
-        # Fallback: go to multi_step_planner
-        return "multi_step_planner"
-
-    workflow.add_conditional_edges("slot_validator", {
-        "sql_generator": lambda state: route_from_slot_validator(state) == "sql_generator",
-        "multi_step_planner": lambda state: route_from_slot_validator(state) == "multi_step_planner",
-        "backend_lookup_node": lambda state: route_from_slot_validator(state) == "backend_lookup_node"
-    })
-    workflow.add_edge("sql_generator", "response_formatter")
+        elif status == "missing_backend":
+            return "backend_lookup"
+        else:
+            return "response_formatter"
+    
+    workflow.add_conditional_edges(
+        "slot_validator",
+        route_after_validation,
+        {
+            "sql_generator": "sql_generator",
+            "backend_lookup": "backend_lookup", 
+            "response_formatter": "response_formatter"
+        }
+    )
+    
+    workflow.add_edge("backend_lookup", "sql_generator")
+    workflow.add_edge("sql_generator", "tool_executor")
+    workflow.add_edge("tool_executor", "response_formatter")
     workflow.add_edge("response_formatter", "memory_manager")
     workflow.add_edge("memory_manager", END)
 
-    # Compile the graph
+    logger.info("Compiling graph...")
     return workflow.compile()
 
 
@@ -109,7 +105,6 @@ class MedicalAssistantAgent:
             state = self.get_or_create_session(session_id, user_role, doctor_id)
             if identity_context:
                 state["identity_context"] = identity_context
-                logger.info(f"Added identity context: {identity_context}")
 
             # Reset relevant state
             state["current_query"] = message
@@ -121,21 +116,13 @@ class MedicalAssistantAgent:
             state["sql_metadata"] = {}
 
             logger.info(f"Processing message for session {session_id}: {message}")
-
             result = self.graph.invoke(state)
             self.sessions[session_id] = result
 
-            # Ensure clarification_prompt is copied into formatted_response if present and formatted_response is empty
+            # Ensure clarification_prompt is copied to formatted_response if needed
             if "clarification_prompt" in result and not result.get("formatted_response"):
                 result["formatted_response"] = result["clarification_prompt"]
 
-            # Debug logging
-            logger.info(f"Graph result - formatted_response: '{result['formatted_response']}'")
-            logger.info(f"Graph result - has_errors: {result['has_errors']}")
-            logger.info(f"Graph result keys: {list(result.keys())}")
-            logger.info(f"Graph result sql_metadata: {result.get('sql_metadata', 'NOT_FOUND')}")
-
-            # Return processed result
             return {
                 "success": not result.get("has_errors", False),
                 "result": result.get("formatted_response", ""),
@@ -160,11 +147,10 @@ class MedicalAssistantAgent:
             }
     
     def get_session_context(self, session_id: str) -> Dict[str, Any]:
-        """Get current context for a session, including all MCP context fields for diagnostics."""
+        """Get current context for a session."""
         if session_id in self.sessions:
             state = self.sessions[session_id]
-            # Gather all relevant context fields for diagnostics
-            context = {
+            return {
                 "patient_context": state.get("patient_context"),
                 "doctor_context": state.get("doctor_context"),
                 "conversation_memory": state.get("conversation_memory", {}),
@@ -180,8 +166,6 @@ class MedicalAssistantAgent:
                 "has_errors": state.get("has_errors", False),
                 "response_metadata": state.get("response_metadata", {}),
             }
-            # Optionally include any other custom MCP context fields here
-            return context
         return {}
     
     def clear_session(self, session_id: str):
