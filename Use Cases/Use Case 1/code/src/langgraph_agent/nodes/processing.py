@@ -1156,6 +1156,9 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
                 debug_lookups["PatientId"] = patient_id
                 logger.info(f"Resolved PatientId for {params['patient_name']}: {patient_id}")
             except Exception as e:
+                import traceback
+                logger.error(f"Exception in get_or_create_patient_id for {params['patient_name']}: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 params["PatientId"] = None
                 resolved["PatientId"] = None
                 logger.warning(f"Could not resolve PatientId for {params['patient_name']}: {e}")
