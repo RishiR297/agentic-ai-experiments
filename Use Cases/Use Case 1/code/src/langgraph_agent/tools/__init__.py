@@ -12,8 +12,7 @@ Core Tools:
 
 from .database import (
     get_or_create_patient_id,
-    execute_query,
-    get_db_path
+    execute_query
 )
 
 from .mcp_context_manager import (
@@ -22,7 +21,6 @@ from .mcp_context_manager import (
 
 __all__ = [
     "get_or_create_patient_id",
-    "execute_query", 
-    "get_db_path",
+    "execute_query",
     "MCPContextManager"
 ]
