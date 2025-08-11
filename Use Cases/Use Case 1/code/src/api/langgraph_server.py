@@ -9,6 +9,7 @@ import os
 import logging
 import json
 from datetime import datetime
+from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,11 +32,22 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    # Startup
+    logger.info("Starting LangGraph Medical Assistant API")
+    logger.info("Agent initialized and ready for multi-turn conversations")
+    yield
+    # Shutdown (if needed)
+    pass
+
 # Initialize FastAPI
 app = FastAPI(
     title="LangGraph Medical Assistant API",
     description="Multi-turn conversational medical assistant with context and memory",
-    version="4.0"
+    version="4.0",
+    lifespan=lifespan
 )
 
 # CORS middleware
@@ -838,13 +850,6 @@ async def root():
             "lan_access": "0.0.0.0:8502"
         }
     }
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the application."""
-    logger.info("Starting LangGraph Medical Assistant API")
-    logger.info("Agent initialized and ready for multi-turn conversations")
 
 if __name__ == "__main__":
     import uvicorn
