@@ -7,7 +7,6 @@ Contains all configuration settings, LLM setup, and system prompts.
 import os
 from typing import Dict, Any, List
 from langchain_openai import AzureChatOpenAI
-from langchain_core.pydantic_v1 import SecretStr
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,29 +14,28 @@ load_dotenv()
 
 class AgentConfig:
     """Configuration class for the medical assistant agent."""
-    
+
     def __init__(self):
-        # Azure OpenAI configuration
+        # Azure OpenAI configuration (LLM is always instantiated internally)
         self.llm = AzureChatOpenAI(
-            api_key=SecretStr(os.getenv("AZURE_OPENAI_API_KEY") or ""),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY") or "",
             api_version="2024-02-15-preview",
             azure_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"),
             temperature=0.0
         )
-        
+
         # Database configuration
         self.db_path = "./db/output.db"
-        
+
         # Agent behavior configuration
         self.enable_memory = True
         self.enable_context_resolution = True
         self.max_conversation_history = 10
         self.max_context_age_minutes = 60
-        
+
         # Tool configuration
         self.available_tools = [
             "appointment_lookup",
-            "schedule_query",
             "schedule_query",
             "patient_history",
             "doctor_availability",
@@ -56,10 +54,11 @@ class AgentConfig:
 
         # System prompts
         self.system_prompts = self._load_system_prompts()
+
     def get_tool_user_fields(self, tool_name: str):
         """Get required user-facing fields for a tool."""
         return self.tool_user_fields.get(tool_name, [])
-    
+
     def _load_system_prompts(self) -> Dict[str, str]:
         """Load all system prompts for different agent nodes."""
         return {
