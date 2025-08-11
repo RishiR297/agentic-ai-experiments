@@ -22,19 +22,19 @@ import logging
 import re
 from typing import Dict, Any
 from datetime import datetime, timedelta
-from langgraph_agent.core.base import AgentState, AgentConfig
-from langgraph_agent.core.state import update_patient_context, add_to_conversation_memory
+from ..core.state import AgentState, update_patient_context, add_to_conversation_memory
+from ..core.config import AgentConfig
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langgraph_agent.tools.database import (
+from ..tools.database import (
     execute_query, get_service_id_and_duration, get_doctor_default_branch
 )
-from langgraph_agent.tools.mcp_context_manager import mcp_context_manager
+from ..tools.mcp_context_manager import mcp_context_manager
 
 # Core agent types
-from langgraph_agent.core.base import AgentState, AgentConfig
+# (Removed duplicate import)
 # LangChain message types
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langgraph_agent.tools.mcp_context_manager import mcp_context_manager
+
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +143,20 @@ def sql_generator_node(state: AgentState, config: AgentConfig) -> AgentState:
     Generates SQL query using LLM and executes it, logging all relevant metadata.
     """
     logger.info("SQL generator node invoked")
+    # Defensive: Always ensure at least one output field is written, even on error
+    # If required context is missing, set error and write to sql_metadata
+    if not state.get("selected_tool"):
+        logger.error("No selected_tool in state for SQL generation.")
+        state.setdefault("errors", []).append("No selected_tool in state for SQL generation.")
+        state["sql_metadata"] = {"error": "No selected_tool in state for SQL generation."}
+        state["has_errors"] = True
+        return state
+    if not state.get("tool_parameters"):
+        logger.error("No tool_parameters in state for SQL generation.")
+        state.setdefault("errors", []).append("No tool_parameters in state for SQL generation.")
+        state["sql_metadata"] = {"error": "No tool_parameters in state for SQL generation."}
+        state["has_errors"] = True
+        return state
     generation_context = {
         "tool_parameters": state.get("tool_parameters", {}),
         "resolved_references": state.get("resolved_references", {}),
@@ -206,7 +220,10 @@ def sql_generator_node(state: AgentState, config: AgentConfig) -> AgentState:
     logger.info(f"OpenAI response content: '{response.content}'")
     if not response.content or response.content.strip() == "":
         logger.error("Empty response from OpenAI")
-        raise ValueError("Empty response from OpenAI")
+        state.setdefault("errors", []).append("Empty response from OpenAI in SQL generator node.")
+        state["sql_metadata"] = {"error": "Empty response from OpenAI in SQL generator node."}
+        state["has_errors"] = True
+        return state
     try:
         result = safe_json_parse(response.content, "SQL generator")
     except Exception as je:
@@ -228,12 +245,25 @@ def sql_generator_node(state: AgentState, config: AgentConfig) -> AgentState:
                     "query_type": "extracted"
                 }
             else:
-                raise je
+                state.setdefault("errors", []).append(f"JSON decode error: {je}")
+                state["sql_metadata"] = {"error": f"JSON decode error: {je}"}
+                state["has_errors"] = True
+                return state
         else:
-            raise je
+            state.setdefault("errors", []).append(f"JSON decode error: {je}")
+            state["sql_metadata"] = {"error": f"JSON decode error: {je}"}
+            state["has_errors"] = True
+            return state
     state["sql_query"] = result.get("sql_query")
     query_params = result.get("query_parameters", [])
     state["sql_query_parameters"] = query_params
+    # Defensive: If no sql_query was produced, set error and write to sql_metadata
+    if not state["sql_query"]:
+        logger.error("No sql_query produced by LLM in SQL generator node.")
+        state.setdefault("errors", []).append("No sql_query produced by LLM in SQL generator node.")
+        state["sql_metadata"] = {"error": "No sql_query produced by LLM in SQL generator node."}
+        state["has_errors"] = True
+        return state
     logger.info(f"[DEBUG] sql_generator_node END: sql_query_parameters = {state['sql_query_parameters']}")
     query_type = result.get("query_type", "unknown")
     reasoning = result.get("reasoning", "No reasoning provided")
@@ -500,16 +530,18 @@ Respond in JSON format:
     is_doctor = user_role.lower() == "doctor" or (doctor_id and str(doctor_id) != "" and str(doctor_id) != "None")
     # Compose system prompt for second-person responses if doctor is logged in
     if is_doctor:
-        system_prompt = (
-            "You are a helpful medical assistant.\n"
-            "The user interacting with you is a doctor (DoctorId: {doctor_id}, DoctorName: {doctor_name}).\n"
-            "Generate all responses in the second person, addressing the doctor directly (e.g., 'You have 3 appointments today', 'Your next patient is...').\n"
-            "If there are errors, ambiguities, or missing information, explain them clearly and politely.\n"
-            "If a clarification prompt is present, use it to ask the doctor for more information.\n"
-            "If the request was successful, summarize the results in a user-friendly way, always using second person.\n"
-            "Always respond in JSON with the following format:\n"
-            "{\n  \"formatted_response\": \"...\",\n  \"response_metadata\": { ... },\n  \"suggested_followups\": []\n}"
-        ).format(doctor_id=doctor_id, doctor_name=doctor_name)
+        system_prompt = f"""You are a helpful medical assistant.
+The user interacting with you is a doctor (DoctorId: {doctor_id}, DoctorName: {doctor_name or 'Unknown'}).
+Generate all responses in the second person, addressing the doctor directly (e.g., 'You have 3 appointments today', 'Your next patient is...').
+If there are errors, ambiguities, or missing information, explain them clearly and politely.
+If a clarification prompt is present, use it to ask the doctor for more information.
+If the request was successful, summarize the results in a user-friendly way, always using second person.
+Always respond in JSON with the following format:
+{{
+  "formatted_response": "...",
+  "response_metadata": {{ ... }},
+  "suggested_followups": []
+}}"""
         prompt = (
             "Given the following context, generate a single, natural, user-facing response. "
             "If there are errors, ambiguities, or missing information, explain them clearly and politely. "
@@ -519,15 +551,17 @@ Respond in JSON format:
             f"CONTEXT:\n{json.dumps(confirmation_context, indent=2, default=str)}"
         )
     else:
-        system_prompt = (
-            "You are a helpful medical assistant.\n"
-            "Your job is to generate a natural, context-aware response for the user based on the provided context.\n"
-            "If there are errors, ambiguities, or missing information, explain them clearly and politely.\n"
-            "If a clarification prompt is present, use it to ask the user for more information.\n"
-            "If the request was successful, summarize the results in a user-friendly way.\n"
-            "Always respond in JSON with the following format:\n"
-            "{\n  \"formatted_response\": \"...\",\n  \"response_metadata\": { ... },\n  \"suggested_followups\": []\n}"
-        )
+        system_prompt = """You are a helpful medical assistant.
+Your job is to generate a natural, context-aware response for the user based on the provided context.
+If there are errors, ambiguities, or missing information, explain them clearly and politely.
+If a clarification prompt is present, use it to ask the user for more information.
+If the request was successful, summarize the results in a user-friendly way.
+Always respond in JSON with the following format:
+{
+  "formatted_response": "...",
+  "response_metadata": { ... },
+  "suggested_followups": []
+}"""
         prompt = (
             "Given the following context, generate a single, natural, user-facing response. "
             "If there are errors, ambiguities, or missing information, explain them clearly and politely. "
@@ -1061,7 +1095,24 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
     resolved = {**params, **state.get("resolved_references", {})}
     backend_fields = ["StatusId", "PatientId", "BranchName", "ServiceId", "BranchId"]
     debug_lookups = {}
-    if state.get("selected_tool") == "appointment_booking":
+    # Defensive: Always write to at least one field, even on error
+    tool = state.get("selected_tool")
+    if not tool:
+        logger.error("No selected_tool in state for backend lookup.")
+        state.setdefault("errors", []).append("No selected_tool in state for backend lookup.")
+        state["slot_validation"] = {"status": "error", "fields": ["selected_tool"]}
+        state["has_errors"] = True
+        logger.debug(f"[backend_lookup_node] Early return: missing selected_tool. State keys: {list(state.keys())}")
+        return state
+    if not params:
+        logger.error("No tool_parameters in state for backend lookup.")
+        state.setdefault("errors", []).append("No tool_parameters in state for backend lookup.")
+        state["slot_validation"] = {"status": "error", "fields": ["tool_parameters"]}
+        state["has_errors"] = True
+        logger.debug(f"[backend_lookup_node] Early return: missing tool_parameters. State keys: {list(state.keys())}")
+        return state
+    logger.debug(f"[backend_lookup_node] Tool: {tool}")
+    if tool == "appointment_booking":
         # --- Datetime Handling ---
         # 1. Handle appointment_datetime in ISO format (2025-04-14T10:45:00)
         if "appointment_datetime" in params and params["appointment_datetime"]:
@@ -1098,7 +1149,7 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
         # --- PatientId Lookup (robust: get_or_create_patient_id) ---
         if "patient_name" in params and params["patient_name"]:
             try:
-                from langgraph_agent.tools.database import get_or_create_patient_id
+                from ..tools.database import get_or_create_patient_id
                 patient_id = get_or_create_patient_id(params["patient_name"])
                 params["PatientId"] = patient_id
                 resolved["PatientId"] = patient_id
@@ -1160,7 +1211,7 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
         doctor_name = None
         if params.get("doctor_id"):
             try:
-                from langgraph_agent.tools.database import execute_query
+                from ..tools.database import execute_query
                 results = execute_query("SELECT DoctorName FROM View_Appointments WHERE DoctorId = ? AND DoctorName IS NOT NULL AND DoctorName != '' LIMIT 1", (params["doctor_id"],))
                 if results and results[0].get("DoctorName"):
                     doctor_name = results[0]["DoctorName"]
@@ -1239,8 +1290,17 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
         logger.info(f"Backend lookup node result: params={params}, debug={backend_logs}")
         print(f"[DEBUG] backend_lookup_node slot_validation: {state.get('slot_validation')}")
         logger.debug(f"Final tool parameters for SQL generation: {json.dumps(params, indent=2)}")
+        logger.debug(f"[backend_lookup_node] Returning for appointment_booking. State keys: {list(state.keys())}")
+        logger.debug(f"[backend_lookup_node] slot_validation: {state.get('slot_validation')}, errors: {state.get('errors')}")
         return state
-    # ...existing code for other tools...
+    # --- Other tools: Only perform lookups if implemented, else set explicit error ---
+    logger.error(f"[backend_lookup_node] No backend lookup implemented for tool: {tool}")
+    state.setdefault("errors", []).append(f"No backend lookup implemented for tool: {tool}")
+    state["slot_validation"] = {"status": "error", "fields": [tool]}
+    state["has_errors"] = True
+    logger.debug(f"[backend_lookup_node] No backend lookup for tool: {tool}. State keys: {list(state.keys())}")
+    logger.debug(f"[backend_lookup_node] slot_validation: {state.get('slot_validation')}, errors: {state.get('errors')}")
+    return state
 
 def memory_manager_node(state: AgentState, config: AgentConfig) -> AgentState:
     """
