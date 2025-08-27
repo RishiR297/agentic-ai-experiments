@@ -114,7 +114,7 @@ def send_chat_message(message: str, user_role: str, doctor_id: str = None) -> Di
             f"{API_BASE_URL}/chat",
             json=payload,
             headers=headers,
-            timeout=30
+            timeout=90
         )
         
         if response.status_code == 200:
@@ -510,7 +510,7 @@ def main():
             # Show role info
             st.info("🩺 **Doctor Access**: Full access to appointments, schedules, and patient information")
         else:
-            st.info("🏢 **Assistant Access**: Schedule viewing and availability checking only")
+            st.info("🏢 **Assistant Access**: Full appointment management for all doctors (booking, rescheduling, cancellation with doctor specification)")
         
         st.divider()
         
