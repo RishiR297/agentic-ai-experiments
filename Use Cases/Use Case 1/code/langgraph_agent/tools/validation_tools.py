@@ -60,10 +60,10 @@ def validate_booking_conflicts_tool(
                 "error_type": "booking_conflict",
                 "conflicts": [
                     {
-                        "PatientName": conf[0],
-                        "StartDateTime": conf[1], 
-                        "EndDateTime": conf[2],
-                        "ServiceName": conf[3]
+                        "PatientName": conf['PatientName'],
+                        "StartDateTime": conf['StartDateTime'], 
+                        "EndDateTime": conf['EndDateTime'],
+                        "ServiceName": conf['ServiceName']
                     } for conf in conflicts
                 ],
                 "message": f"Time slot {start_dt.strftime('%I:%M %p')} is already booked",
@@ -122,18 +122,22 @@ def validate_working_hours_tool(start_datetime: str, doctor_id: str) -> Dict[str
                 "tool_used": "validate_working_hours_tool"
             }
         
-        from_time, to_time = schedule[0]
+        from_time, to_time = schedule[0]['FromTime'], schedule[0]['ToTime']
         
         # Convert times for comparison - handle both time and datetime formats
         try:
+            # Clean up the time format (remove extra decimal places)
+            from_time_clean = from_time.split('.')[0] if '.' in from_time else from_time
+            to_time_clean = to_time.split('.')[0] if '.' in to_time else to_time
+            
             # Try parsing as time first (HH:MM:SS format)
-            from_dt = datetime.strptime(f"{appointment_dt.date()} {from_time}", '%Y-%m-%d %H:%M:%S')
-            to_dt = datetime.strptime(f"{appointment_dt.date()} {to_time}", '%Y-%m-%d %H:%M:%S')
+            from_dt = datetime.strptime(f"{appointment_dt.date()} {from_time_clean}", '%Y-%m-%d %H:%M:%S')
+            to_dt = datetime.strptime(f"{appointment_dt.date()} {to_time_clean}", '%Y-%m-%d %H:%M:%S')
         except ValueError:
             # If that fails, try parsing as just time (HH:MM format)
             try:
-                from_dt = datetime.strptime(f"{appointment_dt.date()} {from_time}", '%Y-%m-%d %H:%M')
-                to_dt = datetime.strptime(f"{appointment_dt.date()} {to_time}", '%Y-%m-%d %H:%M')
+                from_dt = datetime.strptime(f"{appointment_dt.date()} {from_time_clean}", '%Y-%m-%d %H:%M')
+                to_dt = datetime.strptime(f"{appointment_dt.date()} {to_time_clean}", '%Y-%m-%d %H:%M')
             except ValueError:
                 # Log the actual values for debugging
                 return {
@@ -271,7 +275,7 @@ def validate_service_availability_tool(service_name: str, doctor_id: str) -> Dic
                 "valid": False,
                 "error_type": "service_not_found",
                 "requested_service": service_name,
-                "available_services": [service[0] for service in all_services[:10]],
+                "available_services": [service['ServiceName'] for service in all_services[:10]],
                 "message": f"Service '{service_name}' not found in system",
                 "tool_used": "validate_service_availability_tool"
             }
@@ -290,7 +294,7 @@ def validate_service_availability_tool(service_name: str, doctor_id: str) -> Dic
                 [doctor_id, f'%{service_name}%']
             )
             
-            service_count = doctor_provides_service[0][0] if doctor_provides_service else 0
+            service_count = doctor_provides_service[0]['COUNT(*)'] if doctor_provides_service else 0
             
             if service_count == 0:
                 return {
@@ -311,7 +315,7 @@ def validate_service_availability_tool(service_name: str, doctor_id: str) -> Dic
         
         # Find the exact service name match
         try:
-            exact_service = available_services[0][0]  # Take the first match
+            exact_service = available_services[0]['ServiceName']  # Take the first match
         except (IndexError, TypeError) as e:
             return {
                 "valid": False,
@@ -356,7 +360,7 @@ def check_doctor_off_schedule_tool(start_datetime: str, doctor_id: str) -> Dict[
         
         # Check if doctor is off on this date
         off_schedule_query = """
-        SELECT Date, Comment 
+        SELECT Date, Reason 
         FROM COR_DoctorOffSchedule 
         WHERE DoctorId = ? 
         AND Date = ?
@@ -368,12 +372,12 @@ def check_doctor_off_schedule_tool(start_datetime: str, doctor_id: str) -> Dict[
         )
         
         if off_schedule:
-            off_date, comment = off_schedule[0]
+            off_date, reason = off_schedule[0]
             return {
                 "valid": False,
                 "error_type": "doctor_unavailable",
                 "off_date": off_date,
-                "reason": comment or "Doctor is not available",
+                "reason": reason or "Doctor is not available",
                 "message": f"Doctor is not available on {appointment_dt.strftime('%B %d, %Y')}",
                 "tool_used": "check_doctor_off_schedule_tool"
             }
