@@ -8,6 +8,7 @@ import logging
 import json
 import re
 from datetime import datetime, timedelta
+from typing import Dict, Any, List
 from typing import Dict, Any, List, Optional, Union
 from langchain.tools import tool
 
@@ -1164,36 +1165,244 @@ def get_or_create_patient_id(patient_name: str) -> int:
         # Return a fallback ID
         return 9999
 
-def get_service_id_and_duration(service_name: str) -> Dict[str, Any]:
-    """Get service ID and default duration for a service."""
-    # Default service mapping
-    service_mapping = {
-        "consultation": {"id": 1, "duration": 30},
-        "follow-up": {"id": 2, "duration": 20},
-        "check-up": {"id": 3, "duration": 25},
-        "procedure": {"id": 4, "duration": 45},
-        "emergency": {"id": 5, "duration": 60}
-    }
-    
-    service_lower = service_name.lower()
-    for key, value in service_mapping.items():
-        if key in service_lower:
-            return value
-    
-    # Default fallback
-    return {"id": 1, "duration": 30}
-
-def get_doctor_default_branch(doctor_id: int) -> int:
-    """Get doctor's default branch."""
+def get_available_services() -> List[Dict[str, Any]]:
+    """Get all available services from the database."""
     try:
         query = """
-            SELECT DISTINCT BranchId FROM COR_DoctorSchedule 
-            WHERE DoctorId = ? LIMIT 1
+            SELECT DISTINCT ServiceId, ServiceName 
+            FROM View_Appointments 
+            WHERE ServiceName IS NOT NULL AND ServiceName != ''
+            ORDER BY ServiceName
+        """
+        return execute_query(query, [])
+    except Exception as e:
+        logger.error(f"Error fetching available services: {e}")
+        return []
+
+
+@tool("get_available_services")
+def get_available_services_tool() -> Dict[str, Any]:
+    """Get a list of all available medical services that can be booked."""
+    try:
+        services = get_available_services()
+        service_names = [service['ServiceName'] for service in services]
+        return {
+            "success": True,
+            "services": service_names,
+            "total_count": len(service_names),
+            "message": f"Found {len(service_names)} available services"
+        }
+    except Exception as e:
+        logger.error(f"Error getting available services: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Failed to retrieve available services"
+        }
+
+
+def _llm_semantic_service_matching(service_name: str, available_services: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Use LLM to perform semantic matching of service names."""
+    try:
+        from langchain_openai import AzureChatOpenAI
+        import os
+        
+        # Initialize Azure OpenAI client using same config as rest of system
+        llm = AzureChatOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY") or "",
+            api_version="2024-02-15-preview",
+            azure_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"),
+            temperature=0.1
+        )
+        
+        service_list = [service['ServiceName'] for service in available_services]
+        
+        prompt = f"""
+        You are a medical service matcher. Given a user's service request, find the best matching service from the available options.
+        
+        User requested service: "{service_name}"
+        
+        Available services:
+        {', '.join(service_list)}
+        
+        Consider semantic equivalents:
+        - "follow up", "followup", "check up", "checkup" → CONSULTATION
+        - "wrinkle treatment", "anti-aging" → BOTOX
+        - "skin treatment", "facial treatment" → FACIAL
+        - "body contouring", "body sculpting" → EVOLVE X or SCULPTRA
+        - "butt lift", "brazilian butt lift" → BBL
+        - etc.
+        
+        Return ONLY the exact service name from the available list that best matches, or "NO_MATCH" if no reasonable match exists.
+        Be conservative - only match if you're confident about the semantic relationship.
+        """
+        
+        response = llm.invoke(prompt)
+        matched_service = response.content.strip()
+        
+        if matched_service == "NO_MATCH":
+            logger.info(f"LLM determined no semantic match for '{service_name}'")
+            return {
+                "success": False,
+                "error": f"No semantic match found for '{service_name}'",
+                "service_id": None,
+                "canonical_name": None,
+                "duration": None
+            }
+        
+        # Find the matched service in our available services
+        for service_row in available_services:
+            if service_row['ServiceName'] == matched_service:
+                logger.info(f"LLM matched '{service_name}' to '{matched_service}'")
+                return {
+                    "success": True,
+                    "service_id": service_row['ServiceId'], 
+                    "canonical_name": service_row['ServiceName'],
+                    "duration": 30,
+                    "match_type": "semantic_llm"
+                }
+        
+        # If LLM returned a service not in our list, that's an error
+        logger.warning(f"LLM returned invalid service '{matched_service}' not in available list")
+        return {
+            "success": False,
+            "error": f"LLM matching failed - invalid service returned",
+            "service_id": None,
+            "canonical_name": None,
+            "duration": None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in LLM semantic matching: {e}")
+        return {
+            "success": False,
+            "error": f"LLM semantic matching failed: {str(e)}",
+            "service_id": None,
+            "canonical_name": None,
+            "duration": None
+        }
+
+
+def get_service_id_and_duration(service_name: str) -> Dict[str, Any]:
+    """Get service ID and default duration for a service."""
+    try:
+        # First try to lookup from database
+        query = """
+            SELECT DISTINCT ServiceId, ServiceName 
+            FROM View_Appointments 
+            WHERE LOWER(ServiceName) = LOWER(?) 
+            LIMIT 1
+        """
+        result = execute_query(query, [service_name])
+        if result:
+            return {
+                "success": True,
+                "service_id": result[0]['ServiceId'], 
+                "canonical_name": result[0]['ServiceName'],  # Use canonical name from DB
+                "duration": 30
+            }
+        
+        # Try partial matching for common terms
+        if service_name.lower() in ['consultation', 'consult']:
+            # Look for CONSULTATION in database
+            query2 = """
+                SELECT DISTINCT ServiceId, ServiceName 
+                FROM View_Appointments 
+                WHERE UPPER(ServiceName) LIKE '%CONSULTATION%' 
+                LIMIT 1
+            """
+            result2 = execute_query(query2, [])
+            if result2:
+                return {
+                    "success": True,
+                    "service_id": result2[0]['ServiceId'], 
+                    "canonical_name": result2[0]['ServiceName'],  # Use canonical name from DB  
+                    "duration": 30
+                }
+        
+        # Default service mapping fallback - dynamically fetch from database
+        try:
+            # Get all available services from database
+            all_services = get_available_services()
+            
+            if all_services:
+                # Try fuzzy matching with available services
+                service_lower = service_name.lower()
+                for service_row in all_services:
+                    db_service_name = service_row['ServiceName'].lower()
+                    # Check if user input matches or is contained in any database service
+                    if (service_lower in db_service_name or 
+                        db_service_name in service_lower or
+                        any(word in db_service_name for word in service_lower.split()) or
+                        any(word in service_lower for word in db_service_name.split())):
+                        return {
+                            "success": True,
+                            "service_id": service_row['ServiceId'], 
+                            "canonical_name": service_row['ServiceName'],
+                            "duration": 30  # Default duration
+                        }
+                
+                # If fuzzy matching fails, try LLM-powered semantic matching
+                return _llm_semantic_service_matching(service_name, all_services)
+                
+        except Exception as e:
+            logger.warning(f"Could not perform fuzzy service matching: {e}")
+        
+        # Ultimate fallback - return error indication
+        logger.warning(f"No matching service found for '{service_name}' in database")
+        return {
+            "success": False,
+            "error": f"Service '{service_name}' not found in database",
+            "service_id": None,
+            "canonical_name": None,
+            "duration": None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in get_service_id_and_duration: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "service_id": 1,  # Default to CONSULTATION
+            "canonical_name": "CONSULTATION",
+            "duration": 30
+        }
+
+def get_doctor_default_branch(doctor_id: int) -> tuple:
+    """Get doctor's default branch name and ID from View_Appointments."""
+    try:
+        # Get branch info from View_Appointments table where this doctor has appointments
+        query = """
+            SELECT DISTINCT BranchId, BranchName
+            FROM View_Appointments 
+            WHERE DoctorId = ? 
+            AND BranchName IS NOT NULL 
+            AND BranchName != ''
+            AND BranchName != 'Branch ' || BranchId  -- Exclude generic branch names
+            ORDER BY BranchId
+            LIMIT 1
         """
         result = execute_query(query, [doctor_id])
-        return result[0]['BranchId'] if result else 1
-    except:
-        return 1  # Default branch
+        if result:
+            return (result[0]['BranchName'], result[0]['BranchId'])
+        
+        # Fallback: get any branch info for this doctor
+        fallback_query = """
+            SELECT DISTINCT BranchId, BranchName
+            FROM View_Appointments 
+            WHERE DoctorId = ? 
+            ORDER BY BranchId
+            LIMIT 1
+        """
+        fallback_result = execute_query(fallback_query, [doctor_id])
+        if fallback_result:
+            return (fallback_result[0]['BranchName'], fallback_result[0]['BranchId'])
+        
+        # Ultimate fallback to a default branch
+        return ("Dbayeh", 1)
+    except Exception as e:
+        logger.error(f"Error getting doctor branch: {e}")
+        return ("Dbayeh", 1)
 
 def find_available_slots(doctor_id: int, date: str, service_duration_minutes: int = 21, current_time_aware: bool = False) -> List[Dict[str, str]]:
     """
@@ -1398,7 +1607,17 @@ def normalize_appointment_data(appointment_data: Dict[str, Any]) -> Dict[str, An
     """Normalize appointment data for consistent format."""
     try:
         normalized = appointment_data.copy()
-        # Add any normalization logic here
+        
+        # Normalize service name to use canonical database name
+        if normalized.get('service_name'):
+            service_result = get_service_id_and_duration(normalized['service_name'])
+            if service_result and service_result.get('success'):
+                normalized['ServiceName'] = service_result['canonical_name']
+                normalized['service_name'] = service_result['canonical_name']  # Update both
+                logger.info(f"Service name normalized: {appointment_data.get('service_name')} → {service_result['canonical_name']}")
+            else:
+                logger.warning(f"Could not normalize service name: {normalized.get('service_name')}")
+        
         return normalized
     except Exception as e:
         logger.error(f"Error normalizing appointment data: {e}")
