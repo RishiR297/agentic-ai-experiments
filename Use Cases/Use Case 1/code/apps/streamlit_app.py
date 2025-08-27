@@ -11,8 +11,8 @@ from typing import Dict, Any, List
 # Import robust DB connection utility
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from src.db.db_utils import get_db_connection
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from db.db_utils import get_db_connection
 
 # Page configuration
 st.set_page_config(

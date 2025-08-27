@@ -466,8 +466,8 @@ async def chat_endpoint(
         if not session_id:
             session_id = generate_session_id(user_role, doctor_id)
         
-        logger.info(f"🔐 Chat request from {user_role} (session: {session_id})")
-        logger.info(f"📝 Message: {request.message}")
+        logger.info(f"Chat request from {user_role} (session: {session_id})")
+        logger.info(f"Message: {request.message}")
         
         # Process with agent
         result = agent.process_message(
@@ -481,19 +481,19 @@ async def chat_endpoint(
         # Extract SQL metadata for observability
         sql_metadata = result.get("sql_metadata", {})
         if sql_metadata:
-            print(f"🗄️  SQL QUERY: {sql_metadata.get('raw_query', 'N/A')}")
-            print(f"📊 PARAMETERS: {sql_metadata.get('parameters', [])}")
+            print(f"SQL QUERY: {sql_metadata.get('raw_query', 'N/A')}")
+            print(f"PARAMETERS: {sql_metadata.get('parameters', [])}")
         
         # Debug logging for response data
         print("=" * 60)
-        print("🔍 API RESPONSE DEBUG")
+        print("API RESPONSE DEBUG")
         print("=" * 60)
-        print(f"📊 Result keys: {list(result.keys())}")
-        print(f"🆔 Session ID: {session_id}")
-        print(f"🗄️  SQL Metadata present: {bool(sql_metadata)}")
-        print(f"👤 Identity Context present: {bool(identity_context)}")
-        print(f"💬 Conversation Context present: {bool(result.get('conversation_context', {}))}")
-        print(f"📝 Metadata present: {bool(result.get('metadata', {}))}")
+        print(f"Result keys: {list(result.keys())}")
+        print(f"Session ID: {session_id}")
+        print(f"SQL Metadata present: {bool(sql_metadata)}")
+        print(f"Identity Context present: {bool(identity_context)}")
+        print(f"Conversation Context present: {bool(result.get('conversation_context', {}))}")
+        print(f"Metadata present: {bool(result.get('metadata', {}))}")
         print("=" * 60)
         
         response = ChatResponse(
@@ -508,8 +508,8 @@ async def chat_endpoint(
         )
         
         # Debug the actual response being sent
-        print(f"🚀 Response SQL metadata: {response.sql_metadata}")
-        print(f"🚀 Response session_id: {response.session_id}")
+        print(f"Response SQL metadata: {response.sql_metadata}")
+        print(f"Response session_id: {response.session_id}")
         
         return response
         
@@ -653,7 +653,15 @@ async def get_available_tools(
             "schedule_query": "Get doctor's schedule for specific dates/times",
             "patient_history": "Retrieve patient medical history and past appointments",
             "doctor_availability": "Check when doctors are available",
-            "calendar_summary": "Summarize schedule for a day/week"
+            "calendar_summary": "Summarize schedule for a day/week",
+            "appointment_booking": "Book new appointments with conflict detection and validation",
+            "appointment_rescheduling": "Reschedule existing appointments with RBAC permissions",
+            "appointment_cancellation": "Cancel appointments with proper authorization checks",
+            "conflict_detection_validator": "Validate appointment slots for conflicts",
+            "working_hours_validator": "Check if appointment times are within working hours",
+            "appointment_time_validator": "Validate appointment date and time formats",
+            "service_availability_validator": "Check if services are available at requested times",
+            "schedule_analytics": "Analyze schedule patterns and utilization"
         }
         
         for tool in allowed_tools:
@@ -854,4 +862,6 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting LangGraph Medical Assistant server on port 8001...")
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+    logger.info("Health check: http://127.0.0.1:8001/health")
+    logger.info("External access: http://0.0.0.0:8001 (change IP as needed)")
+    uvicorn.run(app, host="0.0.0.0", port=8001)

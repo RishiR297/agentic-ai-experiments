@@ -122,12 +122,28 @@ class MCPMedicalAssistantAgent:
             # Run the MCP-enhanced graph
             result = self.graph.invoke(state, {"configurable": {"agent_config": self.config}})
             
+            # Debug: Log what the graph returns
+            logger.info(f"Graph result keys: {list(result.keys())}")
+            logger.info(f"Graph result fields: {[k for k, v in result.items() if v is not None]}")
+            
             # Update session state
             self.sessions[session_id] = result
             
-            # Return enhanced result with MCP metadata
-            return {
-                "success": not result["has_errors"],
+            # Ensure all required fields are present in the result
+            if "patient_context" not in result:
+                result["patient_context"] = {}
+            if "query_intent" not in result:
+                result["query_intent"] = "general"
+            if "resolved_references" not in result:
+                result["resolved_references"] = {}
+            if "response_metadata" not in result:
+                result["response_metadata"] = {}
+            if "formatted_response" not in result:
+                result["formatted_response"] = "I apologize, but I couldn't process your request properly."
+            
+            # Build the response
+            response_data = {
+                "success": not result.get("has_errors", False),
                 "result": result["formatted_response"],
                 "metadata": {
                     **result["response_metadata"],
@@ -138,12 +154,19 @@ class MCPMedicalAssistantAgent:
                 "tool_name": result.get("selected_tool", "unknown"),
                 "session_id": session_id,
                 "conversation_context": {
-                    "patient_context": result.get("patient_context"),
-                    "query_intent": result.get("query_intent"),
-                    "resolved_references": result.get("resolved_references"),
+                    "patient_context": result.get("patient_context", {}),
+                    "query_intent": result.get("query_intent", "general"),
+                    "resolved_references": result.get("resolved_references", {}),
                     "mcp_enhanced": True
                 }
             }
+            
+            # Debug: Log the final response structure
+            logger.info(f"Final response keys: {list(response_data.keys())}")
+            logger.info(f"Response has conversation_context: {'conversation_context' in response_data}")
+            
+            # Return enhanced result with MCP metadata
+            return response_data
             
         except Exception as e:
             logger.error(f"MCP agent processing error: {e}")
@@ -152,7 +175,14 @@ class MCPMedicalAssistantAgent:
                 "result": f"I encountered an error processing your request: {str(e)}",
                 "metadata": {"error": str(e), "mcp_enhanced": True},
                 "tool_name": "error_handler",
-                "session_id": session_id
+                "session_id": session_id,
+                "conversation_context": {
+                    "patient_context": {},
+                    "query_intent": "error_handling",
+                    "resolved_references": {},
+                    "mcp_enhanced": True,
+                    "error": str(e)
+                }
             }
     
     def process_message_sync(
@@ -167,15 +197,30 @@ class MCPMedicalAssistantAgent:
         Synchronous wrapper for process_message for compatibility with existing API.
         """
         import asyncio
+        import nest_asyncio
         
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(
-                self.process_message(session_id, message, user_role, doctor_id)
-            )
-        finally:
-            loop.close()
+            # Enable nested event loops
+            nest_asyncio.apply()
+            
+            # Run the async method directly
+            return asyncio.run(self.process_message(session_id, message, user_role, doctor_id))
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "result": f"Error in process_message_sync: {str(e)}",
+                "metadata": {"error": str(e), "mcp_enhanced": True},
+                "tool_name": "sync_error_handler",
+                "session_id": session_id,
+                "conversation_context": {
+                    "patient_context": {},
+                    "query_intent": "sync_error_handling",
+                    "resolved_references": {},
+                    "mcp_enhanced": True,
+                    "error": str(e)
+                }
+            }
     
     async def _load_mcp_context_for_session(self, session_id: str, state: AgentState):
         """Load and prepare MCP context for a session."""

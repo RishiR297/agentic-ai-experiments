@@ -11,6 +11,7 @@ import logging
 import asyncio
 from datetime import datetime
 from typing import Optional
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -31,12 +32,40 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from langgraph_agent.core.config import AgentConfig
 from langgraph_agent.mcp.mcp_agent import MCPMedicalAssistantAgent
 
+# Global agent variable
+agent = None
 
-# FastAPI app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    global agent
+    
+    # Startup
+    logger.info("Starting MCP-Enhanced Medical Assistant API")
+    
+    try:
+        config = AgentConfig()
+        agent = MCPMedicalAssistantAgent(config)
+        logger.info("MCP-Enhanced agent initialized successfully")
+        logger.info("✅ Model Context Protocol (MCP) is ENABLED")
+        logger.info("✅ Enhanced context preservation across turns")
+        logger.info("✅ Advanced reference resolution")
+        logger.info("✅ Structured context metadata")
+    except Exception as e:
+        logger.error(f"Failed to initialize MCP agent: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown (if needed)
+    pass
+
+# FastAPI app with lifespan
 app = FastAPI(
     title="MCP-Enhanced Medical Assistant",
     description="Medical Assistant with Model Context Protocol integration",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS middleware
@@ -78,31 +107,6 @@ class HealthResponse(BaseModel):
     agent_status: str
     active_sessions: int
     mcp_enabled: bool = True
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the MCP-enhanced agent on startup."""
-    global agent
-    
-    logger.info("Starting MCP-Enhanced Medical Assistant API")
-    
-    try:
-        # Initialize configuration
-        config = AgentConfig()
-        
-        # Create MCP-enhanced agent
-        agent = MCPMedicalAssistantAgent(config)
-        
-        logger.info("MCP-Enhanced agent initialized successfully")
-        logger.info("✅ Model Context Protocol (MCP) is ENABLED")
-        logger.info("✅ Enhanced context preservation across turns")
-        logger.info("✅ Advanced reference resolution")
-        logger.info("✅ Structured context metadata")
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize MCP agent: {e}")
-        raise
 
 
 def generate_session_id(user_role: str, doctor_id: str = None) -> str:
@@ -311,4 +315,4 @@ if __name__ == "__main__":
     logger.info("   GET /demo/conversation - Demo scenario")
     logger.info("")
     
-    uvicorn.run(app, host="127.0.0.1", port=8002)
+    uvicorn.run(app, host="0.0.0.0", port=8002)

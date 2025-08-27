@@ -12,8 +12,9 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-# Memory database path
-MEMORY_DB_PATH = "./db/conversation_memory.db"
+# Memory database path - use absolute path to avoid working directory issues
+_current_dir = Path(__file__).parent.parent.parent  # Go up to code directory
+MEMORY_DB_PATH = str(_current_dir / "db" / "conversation_memory.db")
 
 @dataclass
 class ConversationTurn:

@@ -8,12 +8,14 @@ from .state import AgentState, create_initial_state
 from .config import AgentConfig
 from ..nodes.processing import (
     context_resolver_node,
+    rbac_evaluation_node,
     tool_selector_node,
     sql_generator_node,
     tool_executor_node,
     response_formatter_node,
     memory_manager_node,
-    slot_validator_node
+    slot_validator_node,
+    backend_lookup_node
 )
 
 logger = logging.getLogger(__name__)
@@ -26,17 +28,13 @@ def create_medical_agent_graph():
     # Add nodes directly - TypedDict handles field validation
     workflow.add_node("context_resolver", lambda state: context_resolver_node(state, config))
     workflow.add_node("tool_selector", lambda state: tool_selector_node(state, config))
+    workflow.add_node("rbac_evaluation", lambda state: rbac_evaluation_node(state, config))
     workflow.add_node("slot_validator", lambda state: slot_validator_node(state, config))
     workflow.add_node("backend_lookup", lambda state: backend_lookup_node(state, config))
     workflow.add_node("sql_generator", lambda state: sql_generator_node(state, config))
     workflow.add_node("tool_executor", lambda state: tool_executor_node(state, config))
     workflow.add_node("response_formatter", lambda state: response_formatter_node(state, config))
     workflow.add_node("memory_manager", lambda state: memory_manager_node(state, config))
-
-    # Import backend_lookup_node function
-    def backend_lookup_node(state, config):
-        from ..nodes.processing import backend_lookup_node as lookup_fn
-        return lookup_fn(state, config)
 
     # Set entry point
     workflow.set_entry_point("context_resolver")
@@ -48,12 +46,16 @@ def create_medical_agent_graph():
     # Conditional routing from slot_validator
     def route_after_validation(state):
         status = state.get("slot_validation", {}).get("status")
-        logger.info(f"Routing after validation: status={status}")
+        tool = state.get("selected_tool")
+        logger.info(f"Routing after validation: status={status}, tool={tool}")
         
         if status == "ok":
             return "sql_generator"
         elif status == "missing_backend":
             return "backend_lookup"
+        elif status == "backend_complete":
+            # For tools like schedule_query that don't need SQL generation
+            return "tool_executor"
         else:
             return "response_formatter"
     
@@ -62,13 +64,96 @@ def create_medical_agent_graph():
         route_after_validation,
         {
             "sql_generator": "sql_generator",
-            "backend_lookup": "backend_lookup", 
+            "backend_lookup": "backend_lookup",
+            "tool_executor": "tool_executor",
             "response_formatter": "response_formatter"
         }
     )
     
-    workflow.add_edge("backend_lookup", "sql_generator")
-    workflow.add_edge("sql_generator", "tool_executor")
+    # Conditional routing from backend_lookup
+    def route_after_backend_lookup(state):
+        status = state.get("slot_validation", {}).get("status")
+        tool = state.get("selected_tool")
+        rbac_error = state.get("rbac_error", False)
+        logger.info(f"Routing after backend lookup: status={status}, tool={tool}")
+        
+        # Check for RBAC denial first
+        if rbac_error or status == "rbac_denied":
+            return "response_formatter"  # Skip RBAC and tool execution, go directly to response formatting
+        
+        if status == "backend_complete":
+            # Tools that don't need SQL generation (use direct function calls)
+            if tool in ["schedule_query", "appointment_rescheduling", "appointment_cancellation", "cancel_appointment", "appointment_query_executor"]:
+                # Check if RBAC evaluation is needed
+                if tool in ["appointment_rescheduling", "appointment_cancellation", "cancel_appointment"]:
+                    return "rbac_evaluation"
+                else:
+                    return "tool_executor"
+            else:
+                # Tools that need SQL generation (appointment_lookup, etc.)
+                return "sql_generator"
+        elif status == "error":
+            # For appointment management tools, even with backend errors, try to proceed with RBAC and tool execution
+            if tool in ["appointment_rescheduling", "appointment_cancellation", "cancel_appointment"]:
+                return "rbac_evaluation"
+            else:
+                # Other tools with errors go to SQL generation as fallback
+                return "sql_generator"
+        else:
+            # Default: proceed to SQL generation
+            return "sql_generator"
+    
+    workflow.add_conditional_edges(
+        "backend_lookup",
+        route_after_backend_lookup,
+        {
+            "sql_generator": "sql_generator",
+            "rbac_evaluation": "rbac_evaluation", 
+            "tool_executor": "tool_executor",
+            "response_formatter": "response_formatter"
+        }
+    )
+    
+    # Conditional routing from sql_generator - Check if RBAC is needed
+    def route_after_sql_generation(state):
+        tool = state.get("selected_tool")
+        logger.info(f"Routing after SQL generation: tool={tool}")
+        
+        # RBAC evaluation required for appointment management operations
+        if tool in ["appointment_rescheduling", "appointment_cancellation", "cancel_appointment"]:
+            return "rbac_evaluation"
+        else:
+            return "tool_executor"
+    
+    workflow.add_conditional_edges(
+        "sql_generator",
+        route_after_sql_generation,
+        {
+            "rbac_evaluation": "rbac_evaluation",
+            "tool_executor": "tool_executor"
+        }
+    )
+    
+    # Conditional routing from RBAC evaluation
+    def route_after_rbac(state):
+        rbac_status = state.get("rbac_evaluation")
+        logger.info(f"Routing after RBAC: status={rbac_status}")
+        
+        if rbac_status == "approved":
+            return "tool_executor"
+        else:
+            # RBAC denied or error - skip tool execution, go directly to response formatting
+            return "response_formatter"
+    
+    workflow.add_conditional_edges(
+        "rbac_evaluation", 
+        route_after_rbac,
+        {
+            "tool_executor": "tool_executor",
+            "response_formatter": "response_formatter"
+        }
+    )
+    
     workflow.add_edge("tool_executor", "response_formatter")
     workflow.add_edge("response_formatter", "memory_manager")
     workflow.add_edge("memory_manager", END)
