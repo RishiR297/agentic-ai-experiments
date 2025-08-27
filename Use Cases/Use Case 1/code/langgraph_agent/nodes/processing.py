@@ -226,16 +226,21 @@ def rbac_evaluation_node(state: AgentState, config: AgentConfig) -> AgentState:
         target_doctor_id = sql_params.get("doctor_id", "")
         
         # Handle streamlit sessions where role is parsed as "streamlit"
-        if user_role == "streamlit" and "doctor" in session_id:
-            user_role = "doctor"
-            # Extract doctor_id from session like "streamlit_doctor_14"
-            if not current_doctor_id and "_" in session_id:
-                parts = session_id.split("_")
-                if len(parts) >= 3 and parts[1] == "doctor":
-                    current_doctor_id = parts[2]
+        if user_role == "streamlit":
+            if "doctor" in session_id:
+                user_role = "doctor"
+                # Extract doctor_id from session like "streamlit_doctor_14"
+                if not current_doctor_id and "_" in session_id:
+                    parts = session_id.split("_")
+                    if len(parts) >= 3 and parts[1] == "doctor":
+                        current_doctor_id = parts[2]
+            elif "assistant" in session_id:
+                user_role = "assistant"
+                # Assistants don't have their own doctor_id
         
-        # Validate required information
-        if not current_doctor_id:
+        # Validate required information for doctors only
+        # Assistants don't need current_doctor_id since they work on behalf of others
+        if user_role == "doctor" and not current_doctor_id:
             state["rbac_evaluation"] = "denied"
             state["rbac_message"] = "Access denied: Doctor identity not established"
             state["rbac_error"] = "Authentication required for appointment management operations"
@@ -2075,6 +2080,26 @@ Select the best tool and parameters. Respond in JSON format:
             logger.info(f"Overriding tool selection for cancel intent: {state['selected_tool']} -> appointment_cancellation")
             state["selected_tool"] = "appointment_cancellation"
             # RBAC will be enforced in the tool executor before actual execution
+        elif state["query_intent"] == "book_appointment":
+            # CRITICAL FIX: Always use appointment_booking tool for booking requests
+            logger.info(f"Overriding tool selection for book_appointment intent: {state['selected_tool']} -> appointment_booking")
+            state["selected_tool"] = "appointment_booking"
+            # Keep the existing tool_parameters but ensure it includes required fields from resolved_references
+            resolved_refs = state.get("resolved_references", {})
+            tool_params = state.get("tool_parameters", {})
+            
+            # Merge resolved references into tool parameters
+            if resolved_refs.get("patient_name"):
+                tool_params["patient_name"] = resolved_refs["patient_name"]
+            if resolved_refs.get("appointment_date"):
+                tool_params["appointment_date"] = resolved_refs["appointment_date"]
+            if resolved_refs.get("appointment_time"):
+                tool_params["appointment_time"] = resolved_refs["appointment_time"]
+            if resolved_refs.get("service_name"):
+                tool_params["service_name"] = resolved_refs["service_name"]
+            
+            tool_params["doctor_id"] = state.get("doctor_id", "")
+            state["tool_parameters"] = tool_params
         
         logger.info(f"Tool selected: {state['selected_tool']} with params: {state['tool_parameters']}")
         
@@ -2568,6 +2593,7 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
             # Detect ISO format with 'T'
             if "T" in dt_str:
                 try:
+                    from datetime import datetime
                     dt_obj = datetime.fromisoformat(dt_str)
                     formatted = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
                     params["StartDateTime"] = formatted
@@ -2582,6 +2608,7 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
         # 2. Handle separate date/time fields
         elif params.get("date") and params.get("time"):
             try:
+                from datetime import datetime
                 dt = datetime.strptime(f"{params['date']} {params['time']}", "%Y-%m-%d %H:%M")
                 formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
                 params["StartDateTime"] = formatted
@@ -2589,6 +2616,37 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
                 logger.info(f"Combined date and time to StartDateTime: {formatted}")
             except Exception as e:
                 logger.warning(f"Could not parse date/time: {e}")
+        
+        # 3. Handle earliest slot booking (find_earliest=True)
+        elif params.get("find_earliest") and params.get("doctor_id") and params.get("appointment_date"):
+            try:
+                from datetime import datetime
+                from ..tools.database import schedule_query
+                # Get available slots for the date
+                result = schedule_query.invoke({
+                    "doctor_id": params["doctor_id"],
+                    "date": params["appointment_date"],
+                    "service_name": params.get("service_name"),
+                    "suggest_slots": False,
+                    "find_earliest": True
+                })
+                
+                if result.get("success") and result.get("available_slots"):
+                    # Take the first (earliest) slot
+                    earliest_slot_str = result["available_slots"][0]  # Format: "10:00 - 10:21"
+                    earliest_time = earliest_slot_str.split(" - ")[0]  # Get "10:00"
+                    
+                    # Combine date and earliest time
+                    dt = datetime.strptime(f"{params['appointment_date']} {earliest_time}", "%Y-%m-%d %H:%M")
+                    formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    params["StartDateTime"] = formatted
+                    resolved["StartDateTime"] = formatted
+                    logger.info(f"Found earliest slot: {earliest_time} -> StartDateTime: {formatted}")
+                else:
+                    logger.warning(f"Could not find earliest slot for doctor {params['doctor_id']} on {params['appointment_date']}")
+            except Exception as e:
+                logger.warning(f"Could not resolve earliest slot: {e}")
+        
         # Remove appointment_date and appointment_time keys if present
         for k in ["appointment_date", "appointment_time"]:
             if k in params:
@@ -2623,6 +2681,12 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
                 params["ServiceId"] = service_info["service_id"]
                 resolved["ServiceId"] = service_info["service_id"]
                 debug_lookups["ServiceId"] = service_info["service_id"]
+                
+                # IMPORTANT: Use canonical service name from database if available
+                if "service_name" in service_info:
+                    params["service_name"] = service_info["service_name"]  # Replace user input with canonical form
+                    logger.info(f"Normalized service name to canonical form: {service_info['service_name']}")
+                
                 logger.info(f"Resolved ServiceId for {params['service_name']}: {service_info['service_id']}")
             else:
                 params["ServiceId"] = None
