@@ -8,11 +8,17 @@ import requests
 import json
 from datetime import datetime
 from typing import Dict, Any, List
-# Import robust DB connection utility
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from db.db_utils import get_db_connection
+
+# Add project root directory to Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+# Explicitly add the `code` directory to Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# Import robust DB connection utility
+from langgraph_agent.tools.database import get_db_connection
 
 # Page configuration
 st.set_page_config(
@@ -555,7 +561,7 @@ def main():
         
         if diagnostics_enabled:
             st.success("✅ Diagnostics Enabled")
-            st.caption("Response details will show: Processing flow, MCP context memory, SQL queries, and technical metadata")
+            st.caption("Response details will show: Processing flow, MCP context, and SQL queries, and technical metadata")
         else:
             st.info("ℹ️ Diagnostics Disabled")
         
