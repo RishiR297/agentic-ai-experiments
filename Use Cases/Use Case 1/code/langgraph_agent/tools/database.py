@@ -8,6 +8,7 @@ import logging
 import json
 import re
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from typing import Dict, Any, List
 from typing import Dict, Any, List, Optional, Union
 from langchain.tools import tool
@@ -20,6 +21,19 @@ from pathlib import Path
 # Database configuration - use absolute path to avoid working directory issues
 _current_dir = Path(__file__).parent.parent.parent  # Go up to code directory
 DB_PATH = str(_current_dir / "db" / "output.db")
+
+SERVICE_ALIASES = {
+    "consult": "consultation",
+    "consultation": "consultation",
+    "consult appt": "consultation",
+    "initial consult": "consultation",
+    "follow up": "consultation",
+    "followup": "consultation",
+    "check up": "consultation",
+    "checkup": "consultation",
+    "facial treatment": "facial",
+    "skin treatment": "facial",
+}
 
 # =============================================================================
 # CORE DATABASE TOOLS - Phase 1 (Working and Tested)
@@ -1169,9 +1183,13 @@ def get_available_services() -> List[Dict[str, Any]]:
     """Get all available services from the database."""
     try:
         query = """
-            SELECT DISTINCT ServiceId, ServiceName 
-            FROM View_Appointments 
-            WHERE ServiceName IS NOT NULL AND ServiceName != ''
+            SELECT DISTINCT ServiceId, TRIM(ServiceName) AS ServiceName
+            FROM (
+                SELECT ServiceId, ServiceName FROM View_Appointments
+                UNION ALL
+                SELECT ServiceId, ServiceName FROM View_Appointments_Setup
+            )
+            WHERE ServiceName IS NOT NULL AND TRIM(ServiceName) != ''
             ORDER BY ServiceName
         """
         return execute_query(query, [])
@@ -1199,6 +1217,117 @@ def get_available_services_tool() -> Dict[str, Any]:
             "error": str(e),
             "message": "Failed to retrieve available services"
         }
+
+
+def normalize_service_name(service_name: Optional[str]) -> str:
+    """Normalize service names for consistent matching."""
+    if not service_name:
+        return ""
+
+    normalized = service_name.strip().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = normalized.replace("&", " and ")
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return SERVICE_ALIASES.get(normalized, normalized)
+
+
+def resolve_service(service_name: str, doctor_id: Optional[Union[int, str]] = None) -> Dict[str, Any]:
+    """
+    Resolve a user-provided service name to a canonical database service.
+
+    Returns:
+        A dict with success, canonical_name, service_id, confidence, match_type,
+        and alternatives when ambiguity remains.
+    """
+    normalized_input = normalize_service_name(service_name)
+    if not normalized_input:
+        return {
+            "success": False,
+            "error": "No service name provided",
+            "service_id": None,
+            "canonical_name": None,
+            "confidence": 0.0,
+            "match_type": "empty_input",
+            "alternatives": []
+        }
+
+    available_services = get_available_services()
+    if not available_services:
+        return {
+            "success": False,
+            "error": "No services available in database",
+            "service_id": None,
+            "canonical_name": None,
+            "confidence": 0.0,
+            "match_type": "no_catalog",
+            "alternatives": []
+        }
+
+    candidates = []
+    for service_row in available_services:
+        canonical_name = service_row["ServiceName"].strip()
+        normalized_db = normalize_service_name(canonical_name)
+        if not normalized_db:
+            continue
+
+        score = 0.0
+        match_type = "none"
+
+        if normalized_db == normalized_input:
+            score = 1.0
+            match_type = "normalized_exact"
+        elif normalized_input in normalized_db or normalized_db in normalized_input:
+            score = 0.93
+            match_type = "normalized_contains"
+        else:
+            score = SequenceMatcher(None, normalized_input, normalized_db).ratio()
+            if score >= 0.85:
+                match_type = "fuzzy"
+
+        if score > 0:
+            candidates.append({
+                "service_id": service_row["ServiceId"],
+                "canonical_name": canonical_name,
+                "normalized_name": normalized_db,
+                "confidence": round(score, 3),
+                "match_type": match_type
+            })
+
+    if not candidates:
+        return {
+            "success": False,
+            "error": f"Service '{service_name}' not found in database",
+            "service_id": None,
+            "canonical_name": None,
+            "confidence": 0.0,
+            "match_type": "no_match",
+            "alternatives": [row["ServiceName"].strip() for row in available_services[:10]]
+        }
+
+    candidates.sort(key=lambda item: (-item["confidence"], item["canonical_name"]))
+    best = candidates[0]
+    alternatives = [item["canonical_name"] for item in candidates[1:4]]
+
+    if doctor_id is not None:
+        try:
+            doctor_query = """
+                SELECT COUNT(*) AS service_count
+                FROM View_Appointments
+                WHERE DoctorId = ? AND TRIM(ServiceName) = ?
+            """
+            doctor_results = execute_query(doctor_query, [doctor_id, best["canonical_name"]])
+            doctor_service_count = doctor_results[0]["service_count"] if doctor_results else 0
+        except Exception as e:
+            logger.warning(f"Could not verify doctor-specific service availability: {e}")
+            doctor_service_count = None
+    else:
+        doctor_service_count = None
+
+    best["doctor_service_count"] = doctor_service_count
+    best["alternatives"] = alternatives
+    best["success"] = True
+    return best
 
 
 def _llm_semantic_service_matching(service_name: str, available_services: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1286,76 +1415,34 @@ def _llm_semantic_service_matching(service_name: str, available_services: List[D
 def get_service_id_and_duration(service_name: str) -> Dict[str, Any]:
     """Get service ID and default duration for a service."""
     try:
-        # First try to lookup from database
-        query = """
-            SELECT DISTINCT ServiceId, ServiceName 
-            FROM View_Appointments 
-            WHERE LOWER(ServiceName) = LOWER(?) 
-            LIMIT 1
-        """
-        result = execute_query(query, [service_name])
-        if result:
+        resolved = resolve_service(service_name)
+        if resolved.get("success"):
             return {
                 "success": True,
-                "service_id": result[0]['ServiceId'], 
-                "canonical_name": result[0]['ServiceName'],  # Use canonical name from DB
-                "duration": 30
+                "service_id": resolved["service_id"],
+                "canonical_name": resolved["canonical_name"],
+                "duration": 30,
+                "match_type": resolved.get("match_type"),
+                "confidence": resolved.get("confidence", 1.0),
+                "alternatives": resolved.get("alternatives", [])
             }
-        
-        # Try partial matching for common terms
-        if service_name.lower() in ['consultation', 'consult']:
-            # Look for CONSULTATION in database
-            query2 = """
-                SELECT DISTINCT ServiceId, ServiceName 
-                FROM View_Appointments 
-                WHERE UPPER(ServiceName) LIKE '%CONSULTATION%' 
-                LIMIT 1
-            """
-            result2 = execute_query(query2, [])
-            if result2:
-                return {
-                    "success": True,
-                    "service_id": result2[0]['ServiceId'], 
-                    "canonical_name": result2[0]['ServiceName'],  # Use canonical name from DB  
-                    "duration": 30
-                }
-        
-        # Default service mapping fallback - dynamically fetch from database
-        try:
-            # Get all available services from database
-            all_services = get_available_services()
-            
-            if all_services:
-                # Try fuzzy matching with available services
-                service_lower = service_name.lower()
-                for service_row in all_services:
-                    db_service_name = service_row['ServiceName'].lower()
-                    # Check if user input matches or is contained in any database service
-                    if (service_lower in db_service_name or 
-                        db_service_name in service_lower or
-                        any(word in db_service_name for word in service_lower.split()) or
-                        any(word in service_lower for word in db_service_name.split())):
-                        return {
-                            "success": True,
-                            "service_id": service_row['ServiceId'], 
-                            "canonical_name": service_row['ServiceName'],
-                            "duration": 30  # Default duration
-                        }
-                
-                # If fuzzy matching fails, try LLM-powered semantic matching
-                return _llm_semantic_service_matching(service_name, all_services)
-                
-        except Exception as e:
-            logger.warning(f"Could not perform fuzzy service matching: {e}")
-        
-        # Ultimate fallback - return error indication
+
+        # Final fallback: allow the LLM to try semantic matching if deterministic
+        # matching fails and a service catalog exists.
+        all_services = get_available_services()
+        if all_services:
+            llm_result = _llm_semantic_service_matching(service_name, all_services)
+            if llm_result.get("success"):
+                return llm_result
+
         logger.warning(f"No matching service found for '{service_name}' in database")
         return {
             "success": False,
-            "error": f"Service '{service_name}' not found in database",
+            "error": resolved.get("error", f"Service '{service_name}' not found in database"),
             "service_id": None,
             "canonical_name": None,
-            "duration": None
+            "duration": None,
+            "alternatives": resolved.get("alternatives", [])
         }
         
     except Exception as e:

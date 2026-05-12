@@ -246,89 +246,42 @@ def validate_service_availability_tool(service_name: str, doctor_id: str) -> Dic
         dict: Validation result with service availability details
     """
     try:
-        from ..tools.database import execute_query
-        
-        # Check if service exists in the system
-        service_query = """
-        SELECT DISTINCT ServiceName 
-        FROM View_Appointments 
-        WHERE UPPER(ServiceName) LIKE UPPER(?) 
-        LIMIT 10
-        """
-        
-        available_services = execute_query(
-            service_query, 
-            [f'%{service_name}%']
-        )
-        
-        if not available_services:
-            # Get all available services for suggestions
-            all_services_query = """
-            SELECT DISTINCT ServiceName 
-            FROM View_Appointments 
-            ORDER BY ServiceName
-            """
-            
-            all_services = execute_query(all_services_query, [])
-            
+        from ..tools.database import get_available_services, resolve_service
+
+        resolved = resolve_service(service_name, doctor_id=doctor_id)
+        if not resolved.get("success"):
+            all_services = get_available_services()
             return {
                 "valid": False,
                 "error_type": "service_not_found",
                 "requested_service": service_name,
-                "available_services": [service['ServiceName'] for service in all_services[:10]],
+                "available_services": [service['ServiceName'].strip() for service in all_services[:10]],
+                "alternatives": resolved.get("alternatives", []),
                 "message": f"Service '{service_name}' not found in system",
                 "tool_used": "validate_service_availability_tool"
             }
-        
-        # Service exists, check if doctor provides this service
-        doctor_service_query = """
-        SELECT COUNT(*) 
-        FROM View_Appointments 
-        WHERE DoctorId = ? 
-        AND UPPER(ServiceName) LIKE UPPER(?)
-        """
-        
-        try:
-            doctor_provides_service = execute_query(
-                doctor_service_query, 
-                [doctor_id, f'%{service_name}%']
-            )
-            
-            service_count = doctor_provides_service[0]['COUNT(*)'] if doctor_provides_service else 0
-            
-            if service_count == 0:
-                return {
-                    "valid": False,
-                    "error_type": "service_not_provided_by_doctor",
-                    "requested_service": service_name,
-                    "doctor_id": doctor_id,
-                    "message": f"Doctor does not provide '{service_name}' service",
-                    "tool_used": "validate_service_availability_tool"
-                }
-        except Exception as db_error:
+
+        doctor_service_count = resolved.get("doctor_service_count")
+        if doctor_service_count == 0:
             return {
                 "valid": False,
-                "error_type": "database_error",
-                "message": f"Database error checking doctor services: {str(db_error)}",
+                "error_type": "service_not_provided_by_doctor",
+                "requested_service": service_name,
+                "doctor_id": doctor_id,
+                "matched_service": resolved.get("canonical_name"),
+                "message": f"Doctor does not provide '{resolved.get('canonical_name')}' service",
                 "tool_used": "validate_service_availability_tool"
             }
-        
-        # Find the exact service name match
-        try:
-            exact_service = available_services[0]['ServiceName']  # Take the first match
-        except (IndexError, TypeError) as e:
-            return {
-                "valid": False,
-                "error_type": "data_access_error",
-                "message": f"Error accessing service data: {str(e)}",
-                "tool_used": "validate_service_availability_tool"
-            }
-        
+
         return {
             "valid": True,
             "requested_service": service_name,
-            "matched_service": exact_service,
-            "message": f"Service '{exact_service}' is available",
+            "matched_service": resolved["canonical_name"],
+            "service_id": resolved.get("service_id"),
+            "match_type": resolved.get("match_type"),
+            "confidence": resolved.get("confidence"),
+            "alternatives": resolved.get("alternatives", []),
+            "message": f"Service '{resolved['canonical_name']}' is available",
             "tool_used": "validate_service_availability_tool"
         }
         
