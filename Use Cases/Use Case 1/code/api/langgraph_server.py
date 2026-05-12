@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from langgraph_agent.core.graph import MedicalAssistantAgent
+from langgraph_agent.clients.tool_gateway import configure_tool_gateway
 
 load_dotenv()
 
@@ -37,6 +38,10 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     # Startup
     logger.info("Starting LangGraph Medical Assistant API")
+    configure_tool_gateway(
+        mode=os.getenv("TOOL_GATEWAY_MODE", "hybrid"),
+        server_url=os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8002"),
+    )
     logger.info("Agent initialized and ready for multi-turn conversations")
     yield
     # Shutdown (if needed)

@@ -109,6 +109,29 @@ class HealthResponse(BaseModel):
     mcp_enabled: bool = True
 
 
+class DoctorAvailabilityToolRequest(BaseModel):
+    doctor_id: str
+    date: Optional[str] = None
+
+
+class CalendarSummaryToolRequest(BaseModel):
+    doctor_id: str
+    date: Optional[str] = None
+
+
+class ScheduleQueryToolRequest(BaseModel):
+    doctor_id: str
+    date: Optional[str] = None
+    include_availability: bool = True
+
+
+class AppointmentQueryExecutorToolRequest(BaseModel):
+    doctor_id: str
+    query_type: str
+    date: Optional[str] = None
+    patient_name: Optional[str] = None
+
+
 def generate_session_id(user_role: str, doctor_id: str = None) -> str:
     """Generate a session ID if not provided."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -234,6 +257,72 @@ async def get_mcp_summary():
         
     except Exception as e:
         logger.error(f"MCP summary error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/doctor_availability")
+async def doctor_availability_tool(request: DoctorAvailabilityToolRequest):
+    """Expose doctor availability as a tool-style MCP server endpoint."""
+    try:
+        from langgraph_agent.tools.database import schedule_query
+
+        result = schedule_query.func(int(request.doctor_id), request.date, True)
+        if result.get("success"):
+            result["query_type"] = "doctor_availability"
+        return result
+    except Exception as e:
+        logger.error(f"Doctor availability tool error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/calendar_summary")
+async def calendar_summary_tool(request: CalendarSummaryToolRequest):
+    """Expose calendar summary as a tool-style MCP server endpoint."""
+    try:
+        from langgraph_agent.tools.database import appointment_query_executor
+
+        result = appointment_query_executor.func(int(request.doctor_id), "daily_schedule", request.date, None)
+        if result.get("success"):
+            result["query_type"] = "calendar_summary"
+        return result
+    except Exception as e:
+        logger.error(f"Calendar summary tool error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/schedule_query")
+async def schedule_query_tool(request: ScheduleQueryToolRequest):
+    """Expose schedule query as a tool-style MCP server endpoint."""
+    try:
+        from langgraph_agent.tools.database import schedule_query
+
+        result = schedule_query.func(
+            int(request.doctor_id),
+            request.date,
+            request.include_availability,
+        )
+        if result.get("success") and not result.get("query_type"):
+            result["query_type"] = "schedule_query"
+        return result
+    except Exception as e:
+        logger.error(f"Schedule query tool error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/appointment_query_executor")
+async def appointment_query_executor_tool(request: AppointmentQueryExecutorToolRequest):
+    """Expose appointment query executor as a tool-style MCP server endpoint."""
+    try:
+        from langgraph_agent.tools.database import appointment_query_executor
+
+        return appointment_query_executor.func(
+            int(request.doctor_id),
+            request.query_type,
+            request.date,
+            request.patient_name,
+        )
+    except Exception as e:
+        logger.error(f"Appointment query executor tool error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
