@@ -394,7 +394,7 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
     
     # For tools that don't use SQL, skip parameter validation
     tool = state.get("selected_tool")
-    backend_complete_tools = ["schedule_query", "appointment_rescheduling", "appointment_cancellation", "appointment_query_executor"]
+    backend_complete_tools = ["schedule_query", "appointment_rescheduling", "appointment_cancellation", "appointment_query_executor", "calendar_summary", "doctor_availability"]
     if tool in backend_complete_tools:
         params = []  # No SQL parameters needed for backend lookup tools
     else:
@@ -412,7 +412,7 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
     
     # Guard: Ensure sql_query is present (except for tools that don't use SQL)
     tool = state.get("selected_tool")
-    backend_complete_tools = ["schedule_query", "appointment_rescheduling", "appointment_cancellation", "appointment_query_executor"]
+    backend_complete_tools = ["schedule_query", "appointment_rescheduling", "appointment_cancellation", "appointment_query_executor", "calendar_summary", "doctor_availability"]
     if tool not in backend_complete_tools and not state.get("sql_query"):
         logger.error("No SQL query found in state. Did you forget to run the SQL generator node?")
         error_msg = "No SQL query found in state. Did you forget to run the SQL generator node?"
@@ -428,15 +428,77 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
         return state
     try:
         if tool == "appointment_booking":
-            results = execute_query(state["sql_query"], params)
+            tool_params = state.get("tool_parameters", {})
+            appointment_id_result = execute_query(
+                "SELECT COALESCE(MAX(AppointmentId), 0) + 1 AS next_id FROM View_Appointments",
+                []
+            )
+            next_appointment_id = appointment_id_result[0]["next_id"] if appointment_id_result else 1
+
+            patient_id = tool_params.get("PatientId")
+            patient_name = tool_params.get("patient_name")
+            doctor_id = tool_params.get("doctor_id")
+            doctor_name = tool_params.get("DoctorName")
+            service_id = tool_params.get("ServiceId")
+            service_name = tool_params.get("ServiceName") or tool_params.get("service_name")
+            branch_name = tool_params.get("BranchName")
+            branch_id = tool_params.get("BranchId")
+            status_id = tool_params.get("StatusId", 1)
+            start_datetime = tool_params.get("StartDateTime")
+            end_datetime = tool_params.get("EndDateTime")
+
+            insert_query = """
+                INSERT INTO View_Appointments
+                (AppointmentId, PatientId, PatientName, DoctorId, DoctorName, BranchId, BranchName,
+                 ServiceId, ServiceName, StartDateTime, EndDateTime, StatusId, Status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            insert_params = [
+                next_appointment_id,
+                patient_id,
+                patient_name,
+                int(doctor_id) if doctor_id is not None else None,
+                doctor_name,
+                branch_id,
+                branch_name,
+                service_id,
+                service_name,
+                start_datetime,
+                end_datetime,
+                status_id,
+                "Scheduled"
+            ]
+            execute_query(insert_query, insert_params)
+
+            results = [{
+                "success": True,
+                "booking_success": True,
+                "AppointmentId": next_appointment_id,
+                "PatientId": patient_id,
+                "PatientName": patient_name,
+                "DoctorId": int(doctor_id) if doctor_id is not None else None,
+                "DoctorName": doctor_name,
+                "ServiceId": service_id,
+                "ServiceName": service_name,
+                "BranchId": branch_id,
+                "BranchName": branch_name,
+                "StartDateTime": start_datetime,
+                "EndDateTime": end_datetime,
+                "StatusId": status_id,
+                "Status": "Scheduled",
+                "message": f"Appointment booked for {patient_name} on {start_datetime}"
+            }]
         elif tool == "schedule_query":
-            # Enhanced schedule_query execution with intelligent slot handling
-            from ..tools.database import schedule_query
+            # Enhanced schedule_query execution with intelligent slot handling.
+            # This now goes through the tool gateway so the orchestration layer
+            # is no longer directly coupled to local tool imports.
+            from ..clients.tool_gateway import get_tool_gateway
             doctor_id = state.get("tool_parameters", {}).get("doctor_id")
             date = state.get("tool_parameters", {}).get("date")
             service_name = state.get("tool_parameters", {}).get("service_name")  # Optional
             suggest_slots = state.get("tool_parameters", {}).get("suggest_slots", False)
             find_earliest = state.get("tool_parameters", {}).get("find_earliest", False)
+            tool_gateway = get_tool_gateway()
             
             # Parse user query for specific slot count requests
             original_query = state.get("current_query", "").lower()
@@ -474,10 +536,14 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
                     logger.info("Detected single slot request from query")
             
             if doctor_id and date:
-                # Use the specialized schedule_query function when we have both doctor_id and date
-                # The schedule_query function only accepts doctor_id, date, and include_availability
+                # Route through the tool gateway. Today this uses the local tool
+                # implementation; later it can become an MCP client call.
                 include_availability = suggest_slots or find_earliest or True  # Default to True for availability
-                result = schedule_query.func(doctor_id, date, include_availability)
+                result = tool_gateway.execute("schedule_query", {
+                    "doctor_id": doctor_id,
+                    "date": date,
+                    "include_availability": include_availability,
+                })
                 
                 # Apply slot count limit if detected
                 if slot_count_limit and result.get("success") and result.get("available_slots"):
@@ -528,20 +594,29 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
             else:
                 error = "Missing doctor_id or date for schedule_query"
         elif tool == "appointment_lookup":
-            # Use enhanced appointment_query_executor for time-aware results
-            from ..tools.database import appointment_query_executor
+            # Use enhanced appointment query execution through the tool gateway.
+            from ..clients.tool_gateway import get_tool_gateway
             
             # Extract parameters for appointment_query_executor
             tool_params = state.get("tool_parameters", {})
             doctor_id = tool_params.get("doctor_id")
             date = tool_params.get("date") or tool_params.get("appointment_date")
             patient_name = tool_params.get("patient") or tool_params.get("patient_name")
-            query_type = "daily_schedule"  # Default for appointment lookups
+            lookup_type = tool_params.get("lookup_type")
+            query_type = "daily_schedule"
+            if lookup_type == "next_patient":
+                query_type = "next_patient"
+            elif lookup_type == "patient_history":
+                query_type = "patient_history"
+            tool_gateway = get_tool_gateway()
             
             if doctor_id and date:
-                # Use the enhanced function for time-aware categorization
-                # Call the tool function directly using .func to bypass LangChain wrapper
-                result = appointment_query_executor.func(int(doctor_id), query_type, date, patient_name)
+                result = tool_gateway.execute("appointment_query_executor", {
+                    "doctor_id": doctor_id,
+                    "query_type": query_type,
+                    "date": date,
+                    "patient_name": patient_name,
+                })
                 if result.get("success"):
                     # For time-categorized results, use the structured data
                     if result.get("time_categorized"):
@@ -558,7 +633,8 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
             results = execute_query(state["sql_query"], params)
         elif tool == "appointment_query_executor":
             # Handle next_patient and other specific appointment queries
-            from ..tools.database import appointment_query_executor
+            # through the tool gateway abstraction.
+            from ..clients.tool_gateway import get_tool_gateway
             
             # Extract parameters from tool_parameters or use defaults
             tool_params = state.get("tool_parameters", {})
@@ -566,10 +642,15 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
             query_type = tool_params.get("query_type", "next_patient")  # Default to next_patient
             date = tool_params.get("date") or tool_params.get("appointment_date")
             patient_name = tool_params.get("patient") or tool_params.get("patient_name")
+            tool_gateway = get_tool_gateway()
             
             if doctor_id:
-                # Call the appointment_query_executor tool function directly
-                result = appointment_query_executor.func(int(doctor_id), query_type, date, patient_name)
+                result = tool_gateway.execute("appointment_query_executor", {
+                    "doctor_id": doctor_id,
+                    "query_type": query_type,
+                    "date": date,
+                    "patient_name": patient_name,
+                })
                 if result.get("success"):
                     results = result.get("results", [])
                 else:
@@ -577,6 +658,49 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
                     results = []
             else:
                 error = "Missing doctor_id for appointment_query_executor"
+        elif tool == "doctor_availability":
+            from ..clients.tool_gateway import get_tool_gateway
+
+            tool_params = state.get("tool_parameters", {})
+            doctor_id = tool_params.get("doctor_id", state.get("doctor_id"))
+            date = tool_params.get("date") or tool_params.get("appointment_date")
+            tool_gateway = get_tool_gateway()
+
+            if doctor_id:
+                result = tool_gateway.execute("doctor_availability", {
+                    "doctor_id": doctor_id,
+                    "date": date,
+                })
+                if result.get("success"):
+                    results = [result]
+                else:
+                    error = result.get("error", "Unknown error in doctor availability query")
+                    results = []
+            else:
+                error = "Missing doctor_id for doctor_availability"
+        elif tool == "calendar_summary":
+            from ..clients.tool_gateway import get_tool_gateway
+
+            tool_params = state.get("tool_parameters", {})
+            doctor_id = tool_params.get("doctor_id", state.get("doctor_id"))
+            date = tool_params.get("date") or tool_params.get("appointment_date")
+            tool_gateway = get_tool_gateway()
+
+            if doctor_id:
+                result = tool_gateway.execute("calendar_summary", {
+                    "doctor_id": doctor_id,
+                    "date": date,
+                })
+                if result.get("success"):
+                    if result.get("time_categorized"):
+                        results = [result]
+                    else:
+                        results = result.get("results", [])
+                else:
+                    error = result.get("error", "Unknown error in calendar summary query")
+                    results = []
+            else:
+                error = "Missing doctor_id for calendar_summary"
         elif tool == "appointment_rescheduling":
             # Handle appointment rescheduling with RBAC-approved access
             from ..tools.database import appointment_rescheduling
@@ -677,22 +801,17 @@ def tool_executor_node(state: AgentState, config: AgentConfig) -> AgentState:
     else:
         # --- Rich tool_results for LLM response (especially after booking) ---
         if tool == "appointment_booking":
-            # Try to fetch the just-booked appointment for confirmation
-            doctor_id = state.get("tool_parameters", {}).get("doctor_id")
-            patient_id = state.get("tool_parameters", {}).get("PatientId")
-            if doctor_id and patient_id:
-                confirm_query = """
-                SELECT * FROM View_Appointments
-                WHERE DoctorId = ? AND PatientId = ?
-                ORDER BY StartDateTime DESC LIMIT 1
-                """
-                confirm_results = execute_query(confirm_query, (doctor_id, patient_id))
-                if confirm_results:
-                    state["tool_results"] = confirm_results
-                else:
-                    state["tool_results"] = results
-            else:
-                state["tool_results"] = results
+            state["tool_results"] = results
+            if results and isinstance(results[0], dict) and results[0].get("booking_success"):
+                booked = results[0]
+                state["formatted_response"] = (
+                    f"I've booked {booked['PatientName']} for {booked['ServiceName']} on "
+                    f"{booked['StartDateTime']} with Dr. {booked['DoctorName']}."
+                )
+                if "response_metadata" not in state:
+                    state["response_metadata"] = {}
+                state["response_metadata"]["booking_success"] = True
+                state["response_metadata"]["booked_appointment"] = booked
         else:
             state["tool_results"] = results
         state["has_errors"] = False
@@ -1072,6 +1191,10 @@ def slot_validator_node(state: AgentState, config: AgentConfig) -> AgentState:
         state["slot_validation"] = {"status": "backend_complete", "fields": []}
         state["clarification_prompt"] = ""
         state["formatted_response"] = ""
+    elif state.get("selected_tool") == "doctor_availability":
+        state["slot_validation"] = {"status": "missing_backend", "fields": missing_backend or ["doctor_availability_params"]}
+        state["clarification_prompt"] = ""
+        state["formatted_response"] = ""
     elif missing_backend or state.get("selected_tool") == "schedule_query":
         # For schedule_query, always route to backend_lookup for parameter processing
         state["slot_validation"] = {"status": "missing_backend", "fields": missing_backend or ["schedule_query_params"]}
@@ -1179,6 +1302,20 @@ Respond in JSON format:
 }}
 """
     # ...existing docstring removed, only valid Python code remains...
+    if state.get("formatted_response") and (
+        state.get("slot_validation", {}).get("status") == "validation_failed"
+        or state.get("response_metadata", {}).get("booking_success")
+    ):
+        logger.info("Using precomputed formatted response")
+        metadata = state.setdefault("response_metadata", {})
+        metadata.update({
+            "intent": state.get("query_intent"),
+            "tool_used": state.get("selected_tool"),
+            "has_errors": state.get("has_errors", False),
+            "context_resolved": bool(state.get("resolved_references"))
+        })
+        return state
+
     logger.info("Formatting response using LLM")
     # Compose a context for the LLM that includes all relevant state, errors, clarifications, and tool results
     from datetime import datetime
@@ -2100,6 +2237,18 @@ Select the best tool and parameters. Respond in JSON format:
             
             tool_params["doctor_id"] = state.get("doctor_id", "")
             state["tool_parameters"] = tool_params
+        elif state["query_intent"] == "doctor_availability":
+            logger.info(f"Overriding tool selection for doctor_availability intent: {state['selected_tool']} -> doctor_availability")
+            state["selected_tool"] = "doctor_availability"
+            resolved_refs = state.get("resolved_references", {})
+            tool_params = state.get("tool_parameters", {})
+            if resolved_refs.get("doctor_name") and not tool_params.get("doctor_name"):
+                tool_params["doctor_name"] = resolved_refs["doctor_name"]
+            if resolved_refs.get("appointment_date") and not tool_params.get("date"):
+                tool_params["date"] = resolved_refs["appointment_date"]
+            if state.get("doctor_id") and not tool_params.get("doctor_id"):
+                tool_params["doctor_id"] = state.get("doctor_id")
+            state["tool_parameters"] = tool_params
         
         logger.info(f"Tool selected: {state['selected_tool']} with params: {state['tool_parameters']}")
         
@@ -2118,6 +2267,14 @@ Select the best tool and parameters. Respond in JSON format:
             resolved_refs = state.get("resolved_references", {})
             if resolved_refs.get("patient_name"):
                 state["tool_parameters"]["patient_name"] = resolved_refs["patient_name"]
+        elif state["query_intent"] == "doctor_availability":
+            state["selected_tool"] = "doctor_availability"
+            resolved_refs = state.get("resolved_references", {})
+            state["tool_parameters"] = {
+                "doctor_id": state.get("doctor_id"),
+                "doctor_name": resolved_refs.get("doctor_name"),
+                "date": resolved_refs.get("appointment_date"),
+            }
         else:
             state["selected_tool"] = "schedule_query"
             state["tool_parameters"] = {"doctor_id": state.get("doctor_id")}
@@ -2652,55 +2809,49 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
             if k in params:
                 del params[k]
 
-        # --- PatientId Lookup (robust: get_or_create_patient_id) ---
-        if "patient_name" in params and params["patient_name"]:
-            try:
-                from ..tools.database import get_or_create_patient_id
-                patient_id = get_or_create_patient_id(params["patient_name"])
-                params["PatientId"] = patient_id
-                resolved["PatientId"] = patient_id
-                debug_lookups["PatientId"] = patient_id
-                logger.info(f"Resolved PatientId for {params['patient_name']}: {patient_id}")
-            except Exception as e:
-                import traceback
-                logger.error(f"Exception in get_or_create_patient_id for {params['patient_name']}: {e}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                params["PatientId"] = None
-                resolved["PatientId"] = None
-                logger.warning(f"Could not resolve PatientId for {params['patient_name']}: {e}")
-        else:
-            params["PatientId"] = None
-            resolved["PatientId"] = None
-            logger.warning("Missing patient_name for PatientId lookup.")
+        # --- Bundled deterministic booking-context lookups through the tool gateway ---
+        from ..clients.tool_gateway import get_tool_gateway
 
-        # --- ServiceId Lookup ---
+        tool_gateway = get_tool_gateway()
         service_info = None
-        if "service_name" in params and params["service_name"]:
-            service_info = get_service_id_and_duration(params["service_name"])
+        try:
+            lookup_result = tool_gateway.execute("resolve_booking_context", {
+                "patient_name": params.get("patient_name"),
+                "service_name": params.get("service_name"),
+                "doctor_id": params.get("doctor_id"),
+            })
+        except Exception as e:
+            lookup_result = {"success": False, "error": str(e)}
+            logger.warning(f"Bundled booking-context lookup failed: {e}")
+
+        if lookup_result.get("success"):
+            patient_id = lookup_result.get("patient_id")
+            service_info = lookup_result.get("service_info")
+            branch_info = lookup_result.get("branch_info")
+            doctor_name = lookup_result.get("doctor_name") or "Unknown Doctor"
+
+            params["PatientId"] = patient_id
+            resolved["PatientId"] = patient_id
+            if patient_id:
+                debug_lookups["PatientId"] = patient_id
+                logger.info(f"Resolved PatientId for {params.get('patient_name')}: {patient_id}")
+            else:
+                logger.warning("Missing or unresolved patient_name for PatientId lookup.")
+
             if service_info and "service_id" in service_info:
                 params["ServiceId"] = service_info["service_id"]
                 resolved["ServiceId"] = service_info["service_id"]
                 debug_lookups["ServiceId"] = service_info["service_id"]
-                
-                # IMPORTANT: Use canonical service name from database if available
-                if "service_name" in service_info:
-                    params["service_name"] = service_info["service_name"]  # Replace user input with canonical form
-                    logger.info(f"Normalized service name to canonical form: {service_info['service_name']}")
-                
-                logger.info(f"Resolved ServiceId for {params['service_name']}: {service_info['service_id']}")
+                canonical_service_name = service_info.get("service_name") or service_info.get("canonical_name")
+                if canonical_service_name:
+                    params["service_name"] = canonical_service_name
+                    logger.info(f"Normalized service name to canonical form: {canonical_service_name}")
+                logger.info(f"Resolved ServiceId for {params.get('service_name')}: {service_info['service_id']}")
             else:
                 params["ServiceId"] = None
                 resolved["ServiceId"] = None
-                logger.warning(f"Could not resolve ServiceId for {params['service_name']}")
-        else:
-            params["ServiceId"] = None
-            resolved["ServiceId"] = None
-            logger.warning("Missing service_name for ServiceId lookup.")
+                logger.warning(f"Could not resolve ServiceId for {params.get('service_name')}")
 
-        # --- BranchId and BranchName Lookup ---
-        branch_info = None
-        if "doctor_id" in params and params["doctor_id"]:
-            branch_info = get_doctor_default_branch(params["doctor_id"])
             if branch_info:
                 params["BranchName"] = branch_info[0]
                 params["BranchId"] = branch_info[1]
@@ -2708,46 +2859,31 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
                 resolved["BranchId"] = branch_info[1]
                 debug_lookups["BranchName"] = branch_info[0]
                 debug_lookups["BranchId"] = branch_info[1]
-                logger.info(f"Resolved Branch info for doctor_id={params['doctor_id']}: {branch_info}")
+                logger.info(f"Resolved Branch info for doctor_id={params.get('doctor_id')}: {branch_info}")
             else:
                 params["BranchName"] = None
                 params["BranchId"] = None
                 resolved["BranchName"] = None
                 resolved["BranchId"] = None
-                logger.warning(f"Could not resolve Branch info for doctor_id={params['doctor_id']}")
+                logger.warning(f"Could not resolve Branch info for doctor_id={params.get('doctor_id')}")
+
+            params["DoctorName"] = doctor_name
+            resolved["DoctorName"] = doctor_name
+            debug_lookups["DoctorName"] = doctor_name
+            logger.info(f"Resolved DoctorName for doctor_id={params.get('doctor_id')}: {doctor_name}")
         else:
+            params["PatientId"] = None
+            resolved["PatientId"] = None
+            params["ServiceId"] = None
+            resolved["ServiceId"] = None
             params["BranchName"] = None
             params["BranchId"] = None
             resolved["BranchName"] = None
             resolved["BranchId"] = None
-            logger.warning("Missing doctor_id for Branch lookup.")
-
-        # --- DoctorName Lookup (always resolve from doctor_id using View_Appointments) ---
-        doctor_name = None
-        if params.get("doctor_id"):
-            try:
-                from ..tools.database import execute_query
-                results = execute_query("SELECT DoctorName FROM View_Appointments WHERE DoctorId = ? AND DoctorName IS NOT NULL AND DoctorName != '' LIMIT 1", (params["doctor_id"],))
-                if results and results[0].get("DoctorName"):
-                    doctor_name = results[0]["DoctorName"]
-                    params["DoctorName"] = doctor_name
-                    resolved["DoctorName"] = doctor_name
-                    debug_lookups["DoctorName"] = doctor_name
-                    logger.info(f"Resolved DoctorName for doctor_id={params['doctor_id']}: {doctor_name}")
-                else:
-                    logger.warning(f"Could not resolve DoctorName for doctor_id={params['doctor_id']}, no matching entry in View_Appointments.")
-            except Exception as e:
-                logger.warning(f"Could not resolve DoctorName for doctor_id={params.get('doctor_id')}: {e}")
-            # Only set Unknown Doctor if not resolved
-            if not doctor_name:
-                params["DoctorName"] = "Unknown Doctor"
-                resolved["DoctorName"] = "Unknown Doctor"
-                debug_lookups["DoctorName"] = "Unknown Doctor"
-        else:
             params["DoctorName"] = "Unknown Doctor"
             resolved["DoctorName"] = "Unknown Doctor"
             debug_lookups["DoctorName"] = "Unknown Doctor"
-            logger.warning("Missing doctor_id for DoctorName lookup, set as 'Unknown Doctor'")
+            logger.warning(f"Could not resolve booking context via gateway: {lookup_result.get('error', 'unknown error')}")
 
         # --- StatusId (default to 1) ---
         params["StatusId"] = 1
@@ -2978,8 +3114,11 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
             if patient_name:
                 # Look up patient ID
                 try:
-                    from ..tools.database import get_or_create_patient_id
-                    patient_id = get_or_create_patient_id(patient_name)
+                    from ..clients.tool_gateway import get_tool_gateway
+                    patient_result = get_tool_gateway().execute("resolve_patient_identity", {
+                        "patient_name": patient_name,
+                    })
+                    patient_id = patient_result.get("patient_id")
                     if patient_id:
                         params["PatientId"] = patient_id
                         params["patient_id"] = patient_id
@@ -3093,7 +3232,24 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
     elif tool == "doctor_availability":
         # --- Doctor Availability: Check doctor schedule and availability ---
         doctor_id = params.get("doctor_id") or state.get("doctor_id")
+        doctor_name = params.get("doctor_name") or state.get("resolved_references", {}).get("doctor_name")
         date = params.get("date") or params.get("appointment_date")
+
+        try:
+            from ..clients.tool_gateway import get_tool_gateway
+
+            if doctor_name or doctor_id:
+                doctor_identity = get_tool_gateway().execute("resolve_doctor_identity", {
+                    "doctor_id": doctor_id,
+                    "doctor_name": doctor_name,
+                })
+                if doctor_identity.get("success"):
+                    doctor_id = doctor_identity.get("doctor_id") or doctor_id
+                    params["doctor_id"] = doctor_id
+                    if doctor_identity.get("doctor_name"):
+                        params["doctor_name"] = doctor_identity["doctor_name"]
+        except Exception as e:
+            logger.warning(f"Could not resolve doctor identity for availability lookup: {e}")
         
         # If no doctor specified, this might be a general availability query
         if not doctor_id:
@@ -3145,8 +3301,11 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
         if patient_name:
             # Look up patient ID
             try:
-                from ..tools.database import get_or_create_patient_id
-                patient_id = get_or_create_patient_id(patient_name)
+                from ..clients.tool_gateway import get_tool_gateway
+                patient_result = get_tool_gateway().execute("resolve_patient_identity", {
+                    "patient_name": patient_name,
+                })
+                patient_id = patient_result.get("patient_id")
                 if patient_id:
                     params["PatientId"] = patient_id
                     params["patient_id"] = patient_id
@@ -3194,37 +3353,38 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
         
         # Find the existing appointment to reschedule
         try:
-            from ..tools.database import find_appointment_for_rescheduling
+            from ..clients.tool_gateway import get_tool_gateway
             from datetime import datetime
+            tool_gateway = get_tool_gateway()
             
             # Look for the appointment by patient name, doctor, and service
             # For rescheduling, we want to find existing appointment, not search by new date
             # Try first without date restriction to find any upcoming appointment
-            appointment_info = find_appointment_for_rescheduling(
-                patient_name=patient_name,
-                doctor_id=doctor_id,
-                service_name=service_name,
-                current_date=None  # Don't restrict by date - find any existing appointment
-            )
+            appointment_info = tool_gateway.execute("find_appointment_for_rescheduling", {
+                "patient_name": patient_name,
+                "doctor_id": doctor_id,
+                "service_name": service_name,
+                "current_date": None,
+            })
             
             # If no appointment found and we have a specific service, try without service filter
             if not appointment_info and service_name:
-                appointment_info = find_appointment_for_rescheduling(
-                    patient_name=patient_name,
-                    doctor_id=doctor_id,
-                    service_name=None,
-                    current_date=None
-                )
+                appointment_info = tool_gateway.execute("find_appointment_for_rescheduling", {
+                    "patient_name": patient_name,
+                    "doctor_id": doctor_id,
+                    "service_name": None,
+                    "current_date": None,
+                })
             
             # If still no appointment, try looking at today's appointments
             if not appointment_info:
                 today = datetime.now().strftime('%Y-%m-%d')
-                appointment_info = find_appointment_for_rescheduling(
-                    patient_name=patient_name,
-                    doctor_id=doctor_id,
-                    service_name=service_name,
-                    current_date=today
-                )
+                appointment_info = tool_gateway.execute("find_appointment_for_rescheduling", {
+                    "patient_name": patient_name,
+                    "doctor_id": doctor_id,
+                    "service_name": service_name,
+                    "current_date": today,
+                })
             
             if appointment_info:
                 # Check for RBAC error
@@ -3269,14 +3429,15 @@ def backend_lookup_node(state: AgentState, config: AgentConfig) -> AgentState:
         
         # Find the existing appointment to cancel
         try:
-            from ..tools.database import find_appointment_for_cancellation
+            from ..clients.tool_gateway import get_tool_gateway
+            tool_gateway = get_tool_gateway()
             # Look for the appointment by patient name, doctor, and optionally service/date
-            appointment_info = find_appointment_for_cancellation(
-                patient_name=patient_name,
-                doctor_id=doctor_id,
-                service_name=service_name,
-                current_date=appointment_date
-            )
+            appointment_info = tool_gateway.execute("find_appointment_for_cancellation", {
+                "patient_name": patient_name,
+                "doctor_id": doctor_id,
+                "service_name": service_name,
+                "current_date": appointment_date,
+            })
             
             if appointment_info:
                 # Check for RBAC error

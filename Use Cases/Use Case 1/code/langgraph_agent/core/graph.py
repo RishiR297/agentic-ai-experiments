@@ -81,9 +81,22 @@ def create_medical_agent_graph():
         if rbac_error or status == "rbac_denied":
             return "response_formatter"  # Skip RBAC and tool execution, go directly to response formatting
         
+        # Hard stop on validation failure - do not continue to SQL generation or execution
+        if status == "validation_failed":
+            return "response_formatter"
+        
         if status == "backend_complete":
             # Tools that don't need SQL generation (use direct function calls)
-            if tool in ["schedule_query", "appointment_rescheduling", "appointment_cancellation", "cancel_appointment", "appointment_query_executor"]:
+            if tool in [
+                "schedule_query",
+                "appointment_lookup",
+                "appointment_rescheduling",
+                "appointment_cancellation",
+                "cancel_appointment",
+                "appointment_query_executor",
+                "calendar_summary",
+                "doctor_availability",
+            ]:
                 # Check if RBAC evaluation is needed
                 if tool in ["appointment_rescheduling", "appointment_cancellation", "cancel_appointment"]:
                     return "rbac_evaluation"
